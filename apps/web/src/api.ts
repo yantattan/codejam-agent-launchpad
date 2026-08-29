@@ -9,16 +9,17 @@ export class ApiError extends Error {
   }
 }
 
-let authToken = "";
+let supabaseToken = "";
 
-export function setAuthToken(token: string): void {
-  authToken = token.trim();
+/** The signed-in user's Supabase session token, sent on every request. */
+export function setSupabaseToken(token: string): void {
+  supabaseToken = token.trim();
 }
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = {
     ...(options?.body ? { "Content-Type": "application/json" } : {}),
-    ...(authToken ? { Authorization: "Bearer " + authToken } : {}),
+    ...(supabaseToken ? { "X-Supabase-Token": supabaseToken } : {}),
     ...options?.headers,
   };
   const response = await fetch(url, {
@@ -33,7 +34,6 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  auth: () => request<{ required: boolean }>("/api/auth"),
   system: () => request<SystemInfo>("/api/system"),
   listAgents: () => request<{ agents: Agent[] }>("/api/agents"),
   createAgent: (body: {
