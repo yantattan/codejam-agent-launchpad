@@ -8,9 +8,10 @@ Run it locally with Docker, Colima, or rootless Podman, or deploy it to
 Volcengine ECS.
 
 > [!WARNING]
-> This is a single-user proof of concept. It intentionally has no identity,
-> tracing, audit, or hardened sandbox middleware. Do not use production data or
-> credentials. See [SECURITY.md](SECURITY.md).
+> This is a hackathon proof of concept. It has per-user identity and Agent
+> ownership (see [Authentication](#authentication-supabase) below) but still
+> has no tracing, audit, or hardened sandbox middleware. Do not use production
+> data or credentials. See [SECURITY.md](SECURITY.md).
 
 ## Screenshots
 
@@ -37,6 +38,8 @@ Volcengine ECS.
 - npm 10+
 - Docker, Colima, or Podman
 - A Volcengine Ark API key and endpoint that supports the Responses API
+- A Supabase project (free tier is fine) for sign-in — see
+  [Authentication](#authentication-supabase)
 
 Codex CLI is included in the Runtime image and is not required on the host.
 
@@ -139,7 +142,6 @@ Required values in `.env`:
 ```dotenv
 ARK_API_KEY=your-ark-api-key
 ARK_MODEL=ep-your-endpoint-id
-APP_AUTH_TOKEN=replace-with-at-least-24-random-characters
 ```
 
 Start the application:
@@ -174,7 +176,48 @@ AGENT_WORKSPACE_ROOT=workspaces
 CODEX_HOME=codex-home
 ```
 
+## Authentication (Supabase)
+
+Every `/api/agents*` and `/api/runs/*` request requires a signed-in Supabase
+user, enforced in [`app.ts`](apps/server/src/app.ts) — not just hidden in the
+UI. Each Agent has an `ownerId`; the service layer
+([`agent-service.ts`](apps/server/src/agent-service.ts)) rejects any read or
+write from a different account with a 404, including sending a prompt to
+someone else's Agent. See [`agent-service.test.ts`](apps/server/src/agent-service.test.ts)
+for the isolation tests.
+
+1. Create a project at [supabase.com](https://supabase.com) (no schema setup
+   needed — this uses Supabase's built-in `auth.users`, no custom tables).
+2. Copy **Settings > API > Project URL** and **anon public key** into `.env`:
+
+   ```dotenv
+   SUPABASE_URL=https://your-project-ref.supabase.co
+   SUPABASE_ANON_KEY=your-anon-key
+   VITE_SUPABASE_URL=https://your-project-ref.supabase.co
+   VITE_SUPABASE_ANON_KEY=your-anon-key
+   ```
+
+   The `SUPABASE_*` pair is read by the server to verify sessions. The
+   `VITE_`-prefixed copies are the same values, exposed to the browser build
+   (Vite only bundles `VITE_`-prefixed variables). The anon key is Supabase's
+   public client key, safe to ship in the browser — never put the
+   `service_role` key here.
+3. Email/password sign-up works immediately. Supabase requires confirming the
+   email by default — for frictionless demos, turn that off under
+   **Authentication > Providers > Email > Confirm email**.
+
+Google sign-in is intentionally left out for now; email/password is the only
+method the login screen offers.
+
 ## Deployment
+
+> [!NOTE]
+> The ECS/Terraform docs below still mention `APP_AUTH_TOKEN`, a shared
+> demo-password gate that predates per-user auth. The app no longer reads
+> that variable — Supabase sign-in is the only access control now — so it's
+> safe to leave out of `.env` for these paths too. That documentation hasn't
+> been updated yet since the cloud deployment path is optional and untested
+> in this change.
 
 - [Existing Linux ECS with Docker](docs/DEPLOYMENT.md#existing-linux-ecs)
 - [Complete Volcengine environment with Terraform](docs/DEPLOYMENT.md#terraform-deployment)
@@ -202,7 +245,7 @@ cp deploy/volcengine/terraform.tfvars.example \
 | `ARK_API_KEY` | Required | Ark model API key. |
 | `ARK_MODEL` | Required | Responses-capable endpoint or model ID. |
 | `ARK_BASE_URL` | Beijing v3 endpoint | Ark OpenAI-compatible API URL. |
-| `APP_AUTH_TOKEN` | Empty on loopback | Shared demo token; use 24+ random characters remotely. |
+| `SUPABASE_URL` / `SUPABASE_ANON_KEY` | Required | Verifies who is signed in; see [Authentication](#authentication-supabase). |
 | `RUNTIME_PROVIDER` | `local-process` | `container` for disposable local Runtime containers. |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | Codex inner sandbox mode. |
 | `CODEX_TIMEOUT_MS` | `600000` | Maximum duration of one turn. |

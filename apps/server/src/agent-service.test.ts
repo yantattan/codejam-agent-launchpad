@@ -56,28 +56,32 @@ async function makeService(runner: AgentRunner = new FakeRunner()): Promise<Agen
   return service;
 }
 
+const ownerA = "11111111-1111-4111-8111-111111111111";
+const ownerB = "22222222-2222-4222-8222-222222222222";
+
 describe("Agent lifecycle", () => {
   it("creates, updates, stops, starts and deletes an Agent", async () => {
     const service = await makeService();
-    const agent = await service.createAgent({ name: "Builder" });
-    expect(service.listAgents()).toHaveLength(1);
-    expect((await service.updateAgent(agent.id, { description: "Builds apps" })).description)
-      .toBe("Builds apps");
-    expect((await service.stopAgent(agent.id)).status).toBe("stopped");
-    expect((await service.startAgent(agent.id)).status).toBe("ready");
-    await service.deleteAgent(agent.id);
-    expect(service.listAgents()).toHaveLength(0);
+    const agent = await service.createAgent({ name: "Builder" }, ownerA);
+    expect(service.listAgents(ownerA)).toHaveLength(1);
+    expect(
+      (await service.updateAgent(agent.id, { description: "Builds apps" }, ownerA)).description,
+    ).toBe("Builds apps");
+    expect((await service.stopAgent(agent.id, ownerA)).status).toBe("stopped");
+    expect((await service.startAgent(agent.id, ownerA)).status).toBe("ready");
+    await service.deleteAgent(agent.id, ownerA);
+    expect(service.listAgents(ownerA)).toHaveLength(0);
   });
 
   it("persists a playground conversation", async () => {
     const service = await makeService();
-    const agent = await service.createAgent({ name: "Coder" });
-    const { run } = await service.sendMessage(agent.id, "write hello world");
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
-    const messages = service.getMessages(agent.id);
+    const agent = await service.createAgent({ name: "Coder" }, ownerA);
+    const { run } = await service.sendMessage(agent.id, "write hello world", ownerA);
+    await expect.poll(() => service.getRun(run.id, ownerA).status).toBe("completed");
+    const messages = service.getMessages(agent.id, ownerA);
     expect(messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(messages[1]?.content).toContain("write hello world");
-    expect(service.getAgent(agent.id).codexThreadId).toBe("fake-thread");
+    expect(service.getAgent(agent.id, ownerA).codexThreadId).toBe("fake-thread");
   });
 
   it("atomically accepts only one concurrent run per Agent", async () => {
@@ -91,21 +95,23 @@ describe("Agent lifecycle", () => {
       isAvailable: async () => true,
     };
     const service = await makeService(runner);
-    const agent = await service.createAgent({ name: "Concurrent" });
+    const agent = await service.createAgent({ name: "Concurrent" }, ownerA);
     const attempts = await Promise.allSettled([
-      service.sendMessage(agent.id, "first"),
-      service.sendMessage(agent.id, "second"),
+      service.sendMessage(agent.id, "first", ownerA),
+      service.sendMessage(agent.id, "second", ownerA),
     ]);
 
     expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
     const rejected = attempts.find((attempt) => attempt.status === "rejected");
     expect(rejected).toMatchObject({ reason: { statusCode: 409 } });
-    expect(service.getMessages(agent.id)).toHaveLength(1);
+    expect(service.getMessages(agent.id, ownerA)).toHaveLength(1);
 
     finish({ output: "done", threadId: "thread", usage: null });
     const accepted = attempts.find((attempt) => attempt.status === "fulfilled");
     if (accepted?.status === "fulfilled") {
-      await expect.poll(() => service.getRun(accepted.value.run.id).status).toBe("completed");
+      await expect
+        .poll(() => service.getRun(accepted.value.run.id, ownerA).status)
+        .toBe("completed");
     }
   });
 
@@ -119,15 +125,67 @@ describe("Agent lifecycle", () => {
       cancel: async () => false,
       isAvailable: async () => true,
     });
-    const agent = await service.createAgent({ name: "Busy" });
-    const { run } = await service.sendMessage(agent.id, "first");
+    const agent = await service.createAgent({ name: "Busy" }, ownerA);
+    const { run } = await service.sendMessage(agent.id, "first", ownerA);
 
-    await expect(service.startAgent(agent.id)).rejects.toMatchObject({ statusCode: 409 });
-    await expect(service.sendMessage(agent.id, "second")).rejects.toMatchObject({
+    await expect(service.startAgent(agent.id, ownerA)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    await expect(service.sendMessage(agent.id, "second", ownerA)).rejects.toMatchObject({
       statusCode: 409,
     });
 
     finish({ output: "done", threadId: "thread", usage: null });
-    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    await expect.poll(() => service.getRun(run.id, ownerA).status).toBe("completed");
+  });
+});
+
+describe("Ownership isolation", () => {
+  it("hides User A's Agent from User B across every read and write path", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Private" }, ownerA);
+
+    await expect(async () => service.getAgent(agent.id, ownerB)).rejects.toMatchObject({
+      statusCode: 404,
+    });
+    await expect(
+      service.updateAgent(agent.id, { name: "Hijacked" }, ownerB),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    await expect(service.startAgent(agent.id, ownerB)).rejects.toMatchObject({
+      statusCode: 404,
+    });
+    await expect(service.stopAgent(agent.id, ownerB)).rejects.toMatchObject({
+      statusCode: 404,
+    });
+    expect(() => service.getMessages(agent.id, ownerB)).toThrowError(
+      expect.objectContaining({ statusCode: 404 }),
+    );
+    expect(() => service.getRuns(agent.id, ownerB)).toThrowError(
+      expect.objectContaining({ statusCode: 404 }),
+    );
+    // The explicit "prompt authorization" check: User B cannot send a
+    // message to an Agent User A owns, even knowing its exact id.
+    await expect(
+      service.sendMessage(agent.id, "steal this workspace", ownerB),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    await expect(service.deleteAgent(agent.id, ownerB)).rejects.toMatchObject({
+      statusCode: 404,
+    });
+
+    // User A is unaffected and still owns a working Agent.
+    expect(service.getAgent(agent.id, ownerA).name).toBe("Private");
+    expect(service.listAgents(ownerB)).toHaveLength(0);
+    expect(service.listAgents(ownerA)).toHaveLength(1);
+  });
+
+  it("a run started by User A cannot be read through User B's id", async () => {
+    const service = await makeService();
+    const agent = await service.createAgent({ name: "Coder" }, ownerA);
+    const { run } = await service.sendMessage(agent.id, "hello", ownerA);
+    await expect.poll(() => service.getRun(run.id, ownerA).status).toBe("completed");
+
+    await expect(async () => service.getRun(run.id, ownerB)).rejects.toMatchObject({
+      statusCode: 404,
+    });
   });
 });

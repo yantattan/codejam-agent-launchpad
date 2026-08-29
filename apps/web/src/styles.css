@@ -412,6 +412,83 @@ button {
   cursor: pointer;
 }
 
+.notice-banner {
+  max-width: 1180px;
+  margin: 0 auto 14px;
+  border-radius: 10px;
+  padding: 10px 13px;
+  font-size: 12px;
+  color: var(--green);
+  background: #e5f3ee;
+  border: 1px solid #bfe0d2;
+}
+
+.user-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px 20px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid #363632;
+}
+
+.user-avatar {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  color: #dcd4ff;
+  background: #4a415f;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.user-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.user-email {
+  font-size: 11px;
+  color: #cfcfc8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-signout {
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: #85857e;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.user-signout:hover {
+  color: #cfcfc8;
+}
+
+.auth-switch {
+  display: block;
+  width: 100%;
+  margin-top: 16px;
+  border: 0;
+  background: transparent;
+  color: var(--purple);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
 .agent-header {
   max-width: 1180px;
   margin: 0 auto 18px;
