@@ -186,8 +186,10 @@ write from a different account with a 404, including sending a prompt to
 someone else's Agent. See [`agent-service.test.ts`](apps/server/src/agent-service.test.ts)
 for the isolation tests.
 
-1. Create a project at [supabase.com](https://supabase.com) (no schema setup
-   needed — this uses Supabase's built-in `auth.users`, no custom tables).
+1. Create a project at [supabase.com](https://supabase.com). Sign-in itself
+   needs no schema — it uses Supabase's built-in `auth.users`. Skip to
+   [Data persistence](#data-persistence-supabase) below if you also want
+   Agents/Messages/Runs to follow the account across machines.
 2. Copy **Settings > API > Project URL** and **anon public key** into `.env`:
 
    ```dotenv
@@ -208,6 +210,41 @@ for the isolation tests.
 
 Google sign-in is intentionally left out for now; email/password is the only
 method the login screen offers.
+
+### Data persistence (Supabase)
+
+By default, Agents/Messages/Runs live in `.data/launchpad.json` on whatever
+machine created them — sign-in follows the account everywhere, but the data
+doesn't. Configuring this makes it: any machine, signed into the same
+account, sees the same Agents and full chat history.
+
+**What does and doesn't follow the account.** Agent config, status, and
+every message/run are stored in Postgres and sync everywhere. The actual
+files Codex writes, and Codex's own session state, are still written to disk
+on whatever machine ran that turn (`.local/workspaces/<id>/`,
+`.local/codex-home/`) — those were never portable and still aren't. Opening
+an Agent on a machine that's never run it before shows the full past
+conversation, but the next message starts a **new** Codex session in a
+freshly-provisioned empty workspace (handled automatically in
+[`agent-service.ts`](apps/server/src/agent-service.ts) — it can't resume a
+session it never had).
+
+1. In the Supabase SQL Editor, run
+   [`docs/supabase-agents-schema.sql`](docs/supabase-agents-schema.sql) once
+   (idempotent — safe to re-run).
+2. Copy **Settings > API > service_role secret** (not the anon key) into
+   `.env` only:
+
+   ```dotenv
+   SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+   ```
+
+   Never add a `VITE_` copy of this — the service_role key bypasses all
+   access control and must never reach the browser. Ownership is enforced
+   in application code ([`supabase-repository.ts`](apps/server/src/supabase-repository.ts)),
+   with Row Level Security policies on the tables as defense-in-depth.
+3. Restart the server. Leave `SUPABASE_SERVICE_ROLE_KEY` unset to keep using
+   the local JSON file — nothing else changes.
 
 ## Deployment
 
@@ -246,6 +283,7 @@ cp deploy/volcengine/terraform.tfvars.example \
 | `ARK_MODEL` | Required | Responses-capable endpoint or model ID. |
 | `ARK_BASE_URL` | Beijing v3 endpoint | Ark OpenAI-compatible API URL. |
 | `SUPABASE_URL` / `SUPABASE_ANON_KEY` | Required | Verifies who is signed in; see [Authentication](#authentication-supabase). |
+| `SUPABASE_SERVICE_ROLE_KEY` | Empty (local JSON file) | Persists Agents/Messages/Runs in Postgres; see [Data persistence](#data-persistence-supabase). |
 | `RUNTIME_PROVIDER` | `local-process` | `container` for disposable local Runtime containers. |
 | `CODEX_SANDBOX_MODE` | `workspace-write` | Codex inner sandbox mode. |
 | `CODEX_TIMEOUT_MS` | `600000` | Maximum duration of one turn. |
@@ -258,7 +296,11 @@ See [.env.example](.env.example) for all Runtime and resource-limit options.
 ```mermaid
 flowchart LR
     UI["React Web UI"] --> API["Fastify control plane"]
-    API --> Store["JSON metadata and Agent workspaces"]
+    API --> Auth["Supabase Auth: who is calling"]
+    API --> Repo{"AgentRepository"}
+    Repo -->|SUPABASE_SERVICE_ROLE_KEY set| PG["Supabase Postgres: Agents, Messages, Runs"]
+    Repo -->|unset| JSON["Local .data/launchpad.json"]
+    API --> Workspaces["Local Agent workspaces (machine-specific)"]
     API --> Runtime{"Runtime provider"}
     Runtime -->|Local POC| Container["Disposable Docker / Colima / Podman container"]
     Runtime -->|ECS profile| Codex["Codex CLI in application container"]

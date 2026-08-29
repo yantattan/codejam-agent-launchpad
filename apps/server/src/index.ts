@@ -4,9 +4,14 @@ import { fileURLToPath } from "node:url";
 import { AgentService } from "./agent-service.js";
 import { createApp } from "./app.js";
 import { SupabaseUserVerifier, UnconfiguredVerifier } from "./auth.js";
-import { isSupabaseConfigured, loadConfig, writeCodexConfig } from "./config.js";
+import {
+  isSupabaseConfigured,
+  isSupabaseDataStoreConfigured,
+  loadConfig,
+  writeCodexConfig,
+} from "./config.js";
+import { createRepository } from "./repository-factory.js";
 import { createRunner } from "./runner-factory.js";
-import { JsonStore } from "./store.js";
 import { WorkspaceManager } from "./workspace.js";
 
 // Node never reads .env on its own. This loads the repo-root .env (two
@@ -19,10 +24,17 @@ loadEnvFile({ path: path.join(repoRoot, ".env") });
 const config = loadConfig();
 await writeCodexConfig(config);
 
-const store = new JsonStore(path.join(config.dataDirectory, "launchpad.json"));
+if (!isSupabaseDataStoreConfigured(config)) {
+  console.warn(
+    "SUPABASE_SERVICE_ROLE_KEY is not set. Agents, messages, and runs are stored " +
+      "only in the local .data/launchpad.json file on this machine, not synced " +
+      "across machines. See README.md#authentication-supabase.",
+  );
+}
+const repository = createRepository(config);
 const workspaces = new WorkspaceManager(config.workspaceRoot);
 const runner = createRunner(config);
-const service = new AgentService(config, store, workspaces, runner);
+const service = new AgentService(config, repository, workspaces, runner);
 await service.initialize();
 
 if (!isSupabaseConfigured(config)) {
