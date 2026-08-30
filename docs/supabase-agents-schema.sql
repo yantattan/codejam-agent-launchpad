@@ -29,15 +29,34 @@ create table if not exists public.runs (
   id uuid primary key,
   agent_id uuid not null references public.agents(id) on delete cascade,
   status text not null default 'queued'
-    check (status in ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    check (status in (
+      'queued', 'running', 'completed', 'failed', 'cancelled',
+      'blocked', 'pending_confirmation', 'discarded'
+    )),
   prompt text not null,
   output text,
   error text,
   usage jsonb,
+  scan jsonb,
+  pending_changes jsonb,
   started_at timestamptz,
   completed_at timestamptz,
   created_at timestamptz not null default now()
 );
+
+-- The two blocks below make the schema safe to re-run against a table that
+-- already existed before the prompt-injection-scan and confirmation-gate
+-- features: add the new columns if missing, and widen the status check
+-- constraint to accept the new statuses those features introduce.
+alter table public.runs add column if not exists scan jsonb;
+alter table public.runs add column if not exists pending_changes jsonb;
+
+alter table public.runs drop constraint if exists runs_status_check;
+alter table public.runs add constraint runs_status_check
+  check (status in (
+    'queued', 'running', 'completed', 'failed', 'cancelled',
+    'blocked', 'pending_confirmation', 'discarded'
+  ));
 
 create index if not exists agents_owner_id_idx on public.agents(owner_id);
 create index if not exists messages_agent_id_idx on public.messages(agent_id);

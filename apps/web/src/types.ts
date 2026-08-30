@@ -1,5 +1,32 @@
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
-export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "blocked"
+  | "pending_confirmation"
+  | "discarded";
+
+export type ScanSeverity = "info" | "suspicious" | "malicious";
+
+export interface ScanFinding {
+  tier: "static" | "semantic";
+  severity: ScanSeverity;
+  technique: string;
+  source: "prompt" | "workspace-file";
+  path?: string;
+  excerpt: string;
+  detail: string;
+}
+
+export interface ScanVerdict {
+  blocked: boolean;
+  findings: ScanFinding[];
+  scannedAt: string;
+  truncated?: boolean;
+}
 
 export interface Agent {
   id: string;
@@ -24,6 +51,30 @@ export interface Message {
   createdAt: string;
 }
 
+export type FileChangeKind = "created" | "modified" | "deleted";
+
+export interface DiffLine {
+  value: string;
+  added?: boolean;
+  removed?: boolean;
+}
+
+export interface FileChange {
+  path: string;
+  kind: FileChangeKind;
+  isBinary: boolean;
+  sizeBefore: number | null;
+  sizeAfter: number | null;
+  diff?: DiffLine[];
+  contentAfter?: string;
+  contentBefore?: string;
+}
+
+export interface PendingChangeSet {
+  files: FileChange[];
+  truncated: boolean;
+}
+
 export interface AgentRun {
   id: string;
   agentId: string;
@@ -37,6 +88,8 @@ export interface AgentRun {
     outputTokens?: number;
   } | null;
   createdAt: string;
+  scan: ScanVerdict | null;
+  pendingChanges: PendingChangeSet | null;
 }
 
 export interface SystemInfo {

@@ -141,6 +141,16 @@ export async function createApp(
     return { run: await service.getRun(id, requireUserId(request)) };
   });
 
+  app.post("/api/runs/:id/confirm", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    return { run: await service.confirmRun(id, requireUserId(request)) };
+  });
+
+  app.post("/api/runs/:id/discard", async (request) => {
+    const { id } = runIdParams.parse(request.params);
+    return { run: await service.discardRun(id, requireUserId(request)) };
+  });
+
   if (config.nodeEnv === "production") {
     const webRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));
     await app.register(fastifyStatic, {

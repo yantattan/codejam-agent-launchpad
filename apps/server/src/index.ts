@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentService } from "./agent-service.js";
 import { createApp } from "./app.js";
+import { ArkSemanticJudge } from "./ark-semantic-judge.js";
 import { SupabaseUserVerifier, UnconfiguredVerifier } from "./auth.js";
 import {
   isSupabaseConfigured,
@@ -10,9 +11,11 @@ import {
   loadConfig,
   writeCodexConfig,
 } from "./config.js";
+import { InjectionScanner } from "./injection-scanner.js";
 import { createRepository } from "./repository-factory.js";
 import { createRunner } from "./runner-factory.js";
 import { WorkspaceManager } from "./workspace.js";
+import { FileSystemWorkspaceTransactionManager } from "./workspace-transaction.js";
 
 // Node never reads .env on its own. This loads the repo-root .env (two
 // directories above apps/server, whether running from src/ via tsx or
@@ -34,7 +37,9 @@ if (!isSupabaseDataStoreConfigured(config)) {
 const repository = createRepository(config);
 const workspaces = new WorkspaceManager(config.workspaceRoot);
 const runner = createRunner(config);
-const service = new AgentService(config, repository, workspaces, runner);
+const scanner = new InjectionScanner(new ArkSemanticJudge(config));
+const transactions = new FileSystemWorkspaceTransactionManager(path.join(config.workspaceRoot, ".tx"));
+const service = new AgentService(config, repository, workspaces, runner, scanner, transactions);
 await service.initialize();
 
 if (!isSupabaseConfigured(config)) {

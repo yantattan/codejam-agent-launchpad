@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, setSupabaseToken } from "./api";
+import { api, setSupabaseToken, setUnauthorizedHandler } from "./api";
 import Login from "./Login";
 import { supabase, supabaseConfigured, type Session } from "./supabaseClient";
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, FileChange, Message, ScanFinding, ScanVerdict, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -37,6 +37,217 @@ function Spinner() {
   return <span className="spinner" aria-label="Loading" />;
 }
 
+function ScanFindingsList({ findings }: { findings: ScanFinding[] }) {
+  if (findings.length === 0) return null;
+  return (
+    <ul className="scan-findings">
+      {findings.map((finding, index) => (
+        <li key={index}>
+          <span className={"scan-severity scan-severity-" + finding.severity}>
+            {finding.severity}
+          </span>
+          <div>
+            <strong>
+              {finding.technique}
+              {finding.path ? " · " + finding.path : ""}
+            </strong>
+            <p>{finding.detail}</p>
+            <code>{finding.excerpt}</code>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function ScanSummary({ scan }: { scan: ScanVerdict }) {
+  if (scan.findings.length === 0) {
+    return (
+      <div className="scan-summary scan-summary-clean">
+        <span>✓</span> Injection scan: prompt and workspace files scanned, nothing found.
+      </div>
+    );
+  }
+  return (
+    <article className="scan-warning">
+      <strong>Injection scan flagged {scan.findings.length} item(s) — run proceeded</strong>
+      <ScanFindingsList findings={scan.findings} />
+    </article>
+  );
+}
+
+function FileChangeBadge({ kind }: { kind: FileChange["kind"] }) {
+  return <span className={"file-change-badge file-change-" + kind}>{kind}</span>;
+}
+
+function FileChangeDetail({ file }: { file: FileChange }) {
+  if (file.isBinary) {
+    return (
+      <p className="file-change-binary-note">
+        Binary file — {file.sizeBefore ?? "new"} → {file.sizeAfter ?? "removed"} bytes.
+      </p>
+    );
+  }
+  if (file.kind === "modified" && file.diff) {
+    return (
+      <pre className="file-diff">
+        <code>
+          {file.diff.map((line, index) => (
+            <span
+              key={index}
+              className={
+                "diff-line " +
+                (line.added
+                  ? "diff-line-added"
+                  : line.removed
+                    ? "diff-line-removed"
+                    : "diff-line-context")
+              }
+            >
+              {line.value}
+            </span>
+          ))}
+        </code>
+      </pre>
+    );
+  }
+  if (file.kind === "created" && file.contentAfter !== undefined) {
+    return (
+      <pre className="file-diff">
+        <code>{file.contentAfter}</code>
+      </pre>
+    );
+  }
+  if (file.kind === "deleted" && file.contentBefore !== undefined) {
+    return (
+      <pre className="file-diff">
+        <code>{file.contentBefore}</code>
+      </pre>
+    );
+  }
+  return null;
+}
+
+function FileChangeRow({
+  file,
+  expanded,
+  onToggle,
+}: {
+  file: FileChange;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <li className="file-change-row">
+      <button type="button" className="file-change-row-header" onClick={onToggle}>
+        <span className={"file-change-caret " + (expanded ? "expanded" : "")}>▸</span>
+        <FileChangeBadge kind={file.kind} />
+        <code>{file.path}</code>
+      </button>
+      {expanded && <div className="file-change-body"><FileChangeDetail file={file} /></div>}
+    </li>
+  );
+}
+
+const fileChangeGroupOrder: FileChange["kind"][] = ["created", "modified", "deleted"];
+const fileChangeGroupLabel: Record<FileChange["kind"], string> = {
+  created: "Created",
+  modified: "Modified",
+  deleted: "Deleted",
+};
+
+function FileChangeGroupBar({ kind, count }: { kind: FileChange["kind"]; count: number }) {
+  return (
+    <div className={"file-change-group-bar file-change-group-" + kind}>
+      {fileChangeGroupLabel[kind]} · {count} file{count === 1 ? "" : "s"}
+    </div>
+  );
+}
+
+function PendingChangesPanel({
+  run,
+  busy,
+  onConfirm,
+  onDiscard,
+}: {
+  run: AgentRun;
+  busy: boolean;
+  onConfirm: () => void;
+  onDiscard: () => void;
+}) {
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+  const files = run.pendingChanges?.files ?? [];
+  const kindsPresent = fileChangeGroupOrder.filter((kind) =>
+    files.some((file) => file.kind === kind),
+  );
+  const groupByKind = kindsPresent.length > 1;
+
+  const toggle = (path: string) => {
+    setExpandedPaths((current) => {
+      const next = new Set(current);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  };
+
+  return (
+    <article className="scan-warning pending-changes-panel">
+      <strong>
+        Codex proposes {files.length} file change{files.length === 1 ? "" : "s"} — review before
+        applying
+      </strong>
+      {groupByKind ? (
+        kindsPresent.map((kind) => {
+          const groupFiles = files.filter((file) => file.kind === kind);
+          return (
+            <div className="file-change-group" key={kind}>
+              <FileChangeGroupBar kind={kind} count={groupFiles.length} />
+              <ul className="file-change-list">
+                {groupFiles.map((file) => (
+                  <FileChangeRow
+                    key={file.path}
+                    file={file}
+                    expanded={expandedPaths.has(file.path)}
+                    onToggle={() => toggle(file.path)}
+                  />
+                ))}
+              </ul>
+            </div>
+          );
+        })
+      ) : (
+        <ul className="file-change-list">
+          {files.map((file) => (
+            <FileChangeRow
+              key={file.path}
+              file={file}
+              expanded={expandedPaths.has(file.path)}
+              onToggle={() => toggle(file.path)}
+            />
+          ))}
+        </ul>
+      )}
+      {run.pendingChanges?.truncated && (
+        <p className="file-change-truncated-note">
+          Some files were too large to fully diff and were reported without detail.
+        </p>
+      )}
+      <div className="pending-changes-actions">
+        <button type="button" className="button button-danger" onClick={onDiscard} disabled={busy}>
+          Discard
+        </button>
+        <button type="button" className="button button-primary" onClick={onConfirm} disabled={busy}>
+          Confirm &amp; Apply
+        </button>
+      </div>
+    </article>
+  );
+}
+
 export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -48,6 +259,7 @@ export default function App() {
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [sessionChecked, setSessionChecked] = useState(false);
@@ -82,6 +294,18 @@ export default function App() {
   const bootstrap = useCallback(async () => {
     await Promise.all([refreshAgents(), api.system().then(setSystem)]);
   }, [refreshAgents]);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setActiveRun(null);
+      setError("Your session expired — please sign in again.");
+      // Clears the local Supabase session too (not just this component's
+      // state), so the app doesn't immediately bounce back in with the
+      // same now-rejected token — this drops straight to the Login screen
+      // via the `!session` branch below, through onAuthStateChange.
+      if (supabase) void supabase.auth.signOut();
+    });
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -120,6 +344,7 @@ export default function App() {
   useEffect(() => {
     setActiveRun(null);
     setShowSettings(false);
+    setSending(false);
     if (!selectedId) {
       setMessages([]);
       return;
@@ -243,26 +468,58 @@ export default function App() {
 
   const sendMessage = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!selected || !prompt.trim()) return;
+    if (!selected || !prompt.trim() || sending) return;
+    const agentId = selected.id;
     const content = prompt.trim();
     setPrompt("");
     setError(null);
+    setSending(true);
     try {
-      const result = await api.sendMessage(selected.id, content);
-      if (selectedIdRef.current === selected.id) {
+      const result = await api.sendMessage(agentId, content);
+      if (selectedIdRef.current === agentId) {
         setMessages((current) => [...current, result.message]);
         setActiveRun(result.run);
       }
       setAgents((current) =>
         current.map((agent) =>
-          agent.id === selected.id ? { ...agent, status: "busy" } : agent,
+          agent.id === agentId ? { ...agent, status: "busy" } : agent,
         ),
       );
-      await pollRun(result.run.id, selected.id);
+      setSending(false);
+      await pollRun(result.run.id, agentId);
+    } catch (reason) {
+      setSending(false);
+      setError(reason instanceof Error ? reason.message : String(reason));
+      if (selectedIdRef.current === agentId) setActiveRun(null);
+      await refreshAgents();
+    }
+  };
+
+  const confirmPendingRun = async (runId: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const { run } = await api.confirmRun(runId);
+      if (selectedIdRef.current === run.agentId) setActiveRun(run);
+      await Promise.all([refreshMessages(run.agentId), refreshAgents()]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
-      setActiveRun(null);
-      await refreshAgents();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const discardPendingRun = async (runId: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const { run } = await api.discardRun(runId);
+      if (selectedIdRef.current === run.agentId) setActiveRun(run);
+      await Promise.all([refreshMessages(run.agentId), refreshAgents()]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -414,7 +671,7 @@ export default function App() {
                   {selected.status === "stopped" ? "Start" : "Stop"}
                 </button>
                 <button
-                  className="button button-danger"
+                  className="button button-delete"
                   onClick={deleteAgent}
                   disabled={busy || selected.status === "busy"}
                 >
@@ -486,7 +743,7 @@ export default function App() {
               </div>
 
               <div className="messages">
-                {messages.length === 0 && !activeRun ? (
+                {messages.length === 0 && !activeRun && !sending ? (
                   <div className="welcome">
                     <div className="welcome-orbit">
                       <div>⌁</div>
@@ -513,10 +770,30 @@ export default function App() {
                         <span>{formatTime(message.createdAt)}</span>
                       </div>
                       <div className="message-body">{message.content}</div>
+                      {message.role === "assistant" &&
+                        activeRun?.status === "pending_confirmation" &&
+                        message.runId === activeRun.id && (
+                          <p className="message-pending-note">
+                            Proposed only — nothing has been applied yet. Review the changes
+                            below before they take effect.
+                          </p>
+                        )}
                     </article>
                   ))
                 )}
-                {activeRun && ["queued", "running"].includes(activeRun.status) && (
+                {sending && (
+                  <article className="message message-assistant thinking">
+                    <div className="message-meta">
+                      <strong>{selected.name}</strong>
+                      <span>sending…</span>
+                    </div>
+                    <div className="thinking-row">
+                      <Spinner />
+                      Scanning the prompt and starting the run…
+                    </div>
+                  </article>
+                )}
+                {!sending && activeRun && ["queued", "running"].includes(activeRun.status) && (
                   <article className="message message-assistant thinking">
                     <div className="message-meta">
                       <strong>{selected.name}</strong>
@@ -528,10 +805,34 @@ export default function App() {
                     </div>
                   </article>
                 )}
-                {activeRun?.status === "failed" && (
+                {!sending && activeRun?.status === "failed" && (
                   <article className="run-error">
                     <strong>Run failed</strong>
                     <span>{activeRun.error}</span>
+                  </article>
+                )}
+                {!sending && activeRun?.status === "blocked" && (
+                  <article className="run-error scan-blocked">
+                    <strong>Blocked — potential prompt injection detected</strong>
+                    <span>Codex never started. The instruction never reached the model.</span>
+                    <ScanFindingsList findings={activeRun.scan?.findings ?? []} />
+                  </article>
+                )}
+                {!sending && activeRun?.status === "completed" && activeRun.scan && (
+                  <ScanSummary scan={activeRun.scan} />
+                )}
+                {!sending && activeRun?.status === "pending_confirmation" && (
+                  <PendingChangesPanel
+                    run={activeRun}
+                    busy={busy}
+                    onConfirm={() => void confirmPendingRun(activeRun.id)}
+                    onDiscard={() => void discardPendingRun(activeRun.id)}
+                  />
+                )}
+                {!sending && activeRun?.status === "discarded" && (
+                  <article className="run-error scan-discarded">
+                    <strong>Proposal discarded</strong>
+                    <span>You reviewed the proposed changes and discarded them — nothing was changed.</span>
                   </article>
                 )}
                 <div ref={messageEnd} />
@@ -550,12 +851,17 @@ export default function App() {
                   placeholder={
                     selected.status === "stopped"
                       ? "Start this Agent to continue…"
-                      : "Describe what you want the Agent to do…"
+                      : sending
+                        ? "Sending…"
+                        : activeRun?.status === "pending_confirmation"
+                          ? "Ask Codex to adjust the proposed changes…"
+                          : "Describe what you want the Agent to do…"
                   }
                   disabled={
+                    sending ||
                     selected.status === "stopped" ||
-                    selected.status === "busy" ||
-                    activeRun != null && ["queued", "running"].includes(activeRun.status)
+                    (selected.status === "busy" && activeRun?.status !== "pending_confirmation") ||
+                    (activeRun != null && ["queued", "running"].includes(activeRun.status))
                   }
                   rows={3}
                 />
@@ -566,14 +872,15 @@ export default function App() {
                   <button
                     className="send-button"
                     disabled={
+                      sending ||
                       !prompt.trim() ||
                       selected.status === "stopped" ||
-                      selected.status === "busy" ||
+                      (selected.status === "busy" && activeRun?.status !== "pending_confirmation") ||
                       (activeRun != null && ["queued", "running"].includes(activeRun.status))
                     }
                     aria-label="Send message"
                   >
-                    ↑
+                    {sending ? <Spinner /> : "↑"}
                   </button>
                 </div>
               </form>

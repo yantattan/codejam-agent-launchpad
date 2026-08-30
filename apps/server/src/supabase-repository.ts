@@ -1,7 +1,7 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { HttpError } from "./errors.js";
 import type { AgentRepository, PersistedAgent } from "./repository.js";
-import type { AgentRun, Message } from "./types.js";
+import type { AgentRun, Message, PendingChangeSet, ScanVerdict } from "./types.js";
 
 const now = () => new Date().toISOString();
 
@@ -35,6 +35,8 @@ interface RunRow {
   output: string | null;
   error: string | null;
   usage: AgentRun["usage"];
+  scan: ScanVerdict | null;
+  pending_changes: PendingChangeSet | null;
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
@@ -113,6 +115,8 @@ export function runFromRow(row: RunRow): AgentRun {
     output: row.output,
     error: row.error,
     usage: row.usage,
+    scan: row.scan,
+    pendingChanges: row.pending_changes,
     startedAt: row.started_at,
     completedAt: row.completed_at,
     createdAt: row.created_at,
@@ -128,6 +132,8 @@ export function runToRow(run: AgentRun): RunRow {
     output: run.output,
     error: run.error,
     usage: run.usage,
+    scan: run.scan,
+    pending_changes: run.pendingChanges,
     started_at: run.startedAt,
     completed_at: run.completedAt,
     created_at: run.createdAt,
@@ -140,6 +146,8 @@ function runPatchToRow(patch: Partial<AgentRun>): Partial<RunRow> {
   if (patch.output !== undefined) row.output = patch.output;
   if (patch.error !== undefined) row.error = patch.error;
   if (patch.usage !== undefined) row.usage = patch.usage;
+  if (patch.scan !== undefined) row.scan = patch.scan;
+  if (patch.pendingChanges !== undefined) row.pending_changes = patch.pendingChanges;
   if (patch.startedAt !== undefined) row.started_at = patch.startedAt;
   if (patch.completedAt !== undefined) row.completed_at = patch.completedAt;
   return row;
@@ -283,7 +291,21 @@ export class SupabaseAgentRepository implements AgentRepository {
       throw new HttpError(409, "Start the Agent before sending a message");
     }
     if (current.status === "busy") {
-      throw new HttpError(409, "This Agent is already running");
+      // A follow-up message while a proposal is awaiting confirmation is a
+      // refinement of that same proposal, not a conflicting new task —
+      // everything else still counts as "already running".
+      const { data: latestRuns, error: latestError } = await this.client
+        .from("runs")
+        .select("status")
+        .eq("agent_id", agentId)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (latestError) throw new Error(latestError.message);
+      const latestStatus = (latestRuns as Array<{ status: AgentRun["status"] }> | null)?.[0]?.status;
+      if (latestStatus !== "pending_confirmation") {
+        throw new HttpError(409, "This Agent is already running");
+      }
+      return current;
     }
     // Conditional on the status we just read, so two concurrent requests
     // (even from different machines) can't both win this race.
@@ -310,7 +332,7 @@ export class SupabaseAgentRepository implements AgentRepository {
         error: "Server restarted while this run was active",
         completed_at: now(),
       })
-      .in("status", ["queued", "running"]);
+      .in("status", ["queued", "running", "pending_confirmation"]);
     if (runsError) throw new Error(runsError.message);
 
     const { error: agentsError } = await this.client

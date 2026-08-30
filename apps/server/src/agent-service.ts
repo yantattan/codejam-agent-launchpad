@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
+import type { InjectionScanner } from "./injection-scanner.js";
 import type { AgentRepository, PersistedAgent } from "./repository.js";
 import type {
   Agent,
@@ -9,11 +10,30 @@ import type {
   AgentRunner,
   CreateAgentInput,
   Message,
+  ScanVerdict,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
+import type { TransactionHandle, WorkspaceTransactionManager } from "./workspace-transaction.js";
 
 const now = () => new Date().toISOString();
+
+function describeScan(verdict: ScanVerdict): string {
+  const blocking = verdict.findings.filter((item) => item.severity === "malicious");
+  const list = (blocking.length > 0 ? blocking : verdict.findings).slice(0, 3);
+  return list
+    .map(
+      (item) =>
+        (item.path ? "[" + item.path + "] " : "") +
+        item.technique +
+        ": " +
+        item.detail +
+        ' — "' +
+        item.excerpt +
+        '"',
+    )
+    .join(" | ");
+}
 
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
@@ -24,12 +44,16 @@ export class AgentService {
     private readonly repository: AgentRepository,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    private readonly scanner: InjectionScanner,
+    private readonly transactions: WorkspaceTransactionManager,
   ) {}
 
   async initialize(): Promise<void> {
     await this.repository.initialize();
     await this.workspaces.initialize();
+    await this.transactions.initialize();
     await this.repository.resetStaleExecutionState();
+    await this.transactions.cleanupStale();
   }
 
   private toPublicAgent(agent: PersistedAgent): Agent {
@@ -91,6 +115,7 @@ export class AgentService {
   async deleteAgent(id: string, ownerId: string): Promise<{ archivedWorkspace: string | null }> {
     const agent = await this.getAgent(id, ownerId);
     await this.cancelExecution(id);
+    await this.discardPendingTransactionIfAny(agent);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.repository.deleteAgent(id, ownerId);
     return { archivedWorkspace };
@@ -102,9 +127,64 @@ export class AgentService {
   }
 
   async stopAgent(id: string, ownerId: string): Promise<Agent> {
-    await this.getAgent(id, ownerId);
+    const agent = await this.getAgent(id, ownerId);
     await this.cancelExecution(id);
+    await this.discardPendingTransactionIfAny(agent);
     return this.setStatus(id, ownerId, "stopped");
+  }
+
+  /**
+   * Confirms a pending proposal: swaps the staged copy into the real
+   * workspace. Guarded against acting on a stale run — if a follow-up
+   * refinement has already produced a newer pending run for this Agent,
+   * that newer one is the only one still backed by a live staging copy.
+   */
+  async confirmRun(runId: string, ownerId: string): Promise<AgentRun> {
+    const run = await this.getRun(runId, ownerId);
+    const agent = await this.getAgent(run.agentId, ownerId);
+    if (run.status !== "pending_confirmation") {
+      throw new HttpError(409, "This run is not awaiting confirmation");
+    }
+    if ((await this.latestRun(agent.id))?.id !== run.id) {
+      throw new HttpError(409, "This proposal has been superseded by a newer one");
+    }
+    const handle = await this.transactions.begin(agent.id, agent.workspacePath);
+    await this.transactions.commit(handle);
+    const completedAt = now();
+    const updated = await this.repository.updateRun(runId, { status: "completed", completedAt });
+    if (!updated) {
+      throw new HttpError(404, "Run not found");
+    }
+    if (agent.status !== "stopped") {
+      await this.repository.updateAgent(agent.id, ownerId, { status: "ready", updatedAt: completedAt });
+    }
+    return updated;
+  }
+
+  /**
+   * Discards a pending proposal: the staged copy is deleted, the real
+   * workspace was never touched. Same staleness guard as confirmRun.
+   */
+  async discardRun(runId: string, ownerId: string): Promise<AgentRun> {
+    const run = await this.getRun(runId, ownerId);
+    const agent = await this.getAgent(run.agentId, ownerId);
+    if (run.status !== "pending_confirmation") {
+      throw new HttpError(409, "This run is not awaiting confirmation");
+    }
+    if ((await this.latestRun(agent.id))?.id !== run.id) {
+      throw new HttpError(409, "This proposal has been superseded by a newer one");
+    }
+    const handle = await this.transactions.begin(agent.id, agent.workspacePath);
+    await this.transactions.rollback(handle);
+    const completedAt = now();
+    const updated = await this.repository.updateRun(runId, { status: "discarded", completedAt });
+    if (!updated) {
+      throw new HttpError(404, "Run not found");
+    }
+    if (agent.status !== "stopped") {
+      await this.repository.updateAgent(agent.id, ownerId, { status: "ready", updatedAt: completedAt });
+    }
+    return updated;
   }
 
   async getMessages(agentId: string, ownerId: string): Promise<Message[]> {
@@ -137,10 +217,20 @@ export class AgentService {
         "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
       );
     }
+    const agent = await this.getAgent(agentId, ownerId);
+    const promptScan = await this.scanner.scan(agent, [{ source: "prompt", text: prompt }]);
+    if (promptScan.blocked) {
+      throw new HttpError(
+        422,
+        "Blocked: potential prompt injection detected. " + describeScan(promptScan),
+      );
+    }
+
     const agentAtStart = await this.repository.beginRun(agentId, ownerId);
     if (!agentAtStart) {
       throw new HttpError(404, "Agent not found");
     }
+
     const timestamp = now();
     const runId = randomUUID();
     const run: AgentRun = {
@@ -154,6 +244,8 @@ export class AgentService {
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
+      scan: promptScan,
+      pendingChanges: null,
     };
     const message: Message = {
       id: randomUUID(),
@@ -166,7 +258,7 @@ export class AgentService {
     await this.repository.insertRun(run);
     await this.repository.insertMessage(message);
 
-    const execution = this.executeRun(this.toPublicAgent(agentAtStart), run);
+    const execution = this.executeRun(this.toPublicAgent(agentAtStart), run, promptScan);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
@@ -197,7 +289,7 @@ export class AgentService {
     };
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(agentAtStart: Agent, run: AgentRun, promptScan: ScanVerdict): Promise<void> {
     await this.repository.updateRun(run.id, { status: "running", startedAt: now() });
 
     // An Agent synced from another machine has no local workspace or Codex
@@ -213,21 +305,112 @@ export class AgentService {
       });
     }
 
+    let handle: TransactionHandle | null = null;
     try {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+
+      // Every run works in an isolated staged copy of the workspace — the
+      // real one is only ever touched at explicit user confirmation. If a
+      // proposal from an earlier turn is still pending, this reuses that
+      // same staged copy instead of starting over, so a follow-up prompt
+      // refines the same proposal rather than losing it.
+      handle = await this.transactions.begin(agentAtStart.id, agentAtStart.workspacePath);
+
+      // Scan the workspace on every turn (including resumed threads) —
+      // this is what Codex is about to read this turn, and catches content
+      // that arrived after the Agent was created (a file added between
+      // turns, or by a prior turn's own output). Scanned from the staged
+      // copy, since that's what the Runner is about to actually read.
+      const {
+        files,
+        truncated: filesTruncated,
+        extraFindings,
+      } = await this.workspaces.readScannableFiles({ ...agentAtStart, workspacePath: handle.workingPath });
+      const fileScan = await this.scanner.scan(
+        agentAtStart,
+        files.map((file) => ({ source: "workspace-file" as const, path: file.path, text: file.content })),
+      );
+      const allFindings = [...promptScan.findings, ...fileScan.findings, ...extraFindings];
+      const combinedScan: ScanVerdict = {
+        blocked: allFindings.some((item) => item.severity === "malicious"),
+        findings: allFindings,
+        scannedAt: now(),
+        ...((promptScan.truncated ?? false) || (fileScan.truncated ?? false) || filesTruncated
+          ? { truncated: true }
+          : {}),
+      };
+
+      if (combinedScan.blocked) {
+        // Fail closed: a scan hit means the whole pending proposal is
+        // discarded, not just this turn's delta — nothing suspect stays
+        // staged waiting for a later confirm.
+        await this.transactions.rollback(handle);
+        const completedAt = now();
+        await this.repository.updateRun(run.id, {
+          status: "blocked",
+          scan: combinedScan,
+          error: "Blocked by prompt-injection scan: " + describeScan(combinedScan),
+          completedAt,
+        });
+        const latest = await this.repository.getAgent(agentAtStart.id, agentAtStart.ownerId);
+        if (latest && latest.status !== "stopped") {
+          await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
+            status: "ready",
+            updatedAt: completedAt,
+          });
+        }
+        return;
+      }
+
       const result = await this.runner.run({
         agentId: agentAtStart.id,
-        workspacePath: agentAtStart.workspacePath,
+        workspacePath: handle.workingPath,
         prompt: run.prompt,
         threadId,
       });
+
+      const { files: changedFiles, truncated: changesTruncated } = await this.transactions.diffChanges(handle);
       const completedAt = now();
+
+      if (changedFiles.length === 0) {
+        // Nothing to review — commit is a same-content swap, so this stays
+        // as frictionless as a plain Q&A turn always was.
+        await this.transactions.commit(handle);
+        await this.repository.updateRun(run.id, {
+          status: "completed",
+          output: result.output,
+          usage: result.usage,
+          scan: combinedScan,
+          pendingChanges: null,
+          completedAt,
+        });
+        await this.repository.insertMessage({
+          id: randomUUID(),
+          agentId: agentAtStart.id,
+          runId: run.id,
+          role: "assistant",
+          content: result.output,
+          createdAt: completedAt,
+        });
+        await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
+          status: "ready",
+          codexThreadId: result.threadId,
+          lastError: null,
+          updatedAt: completedAt,
+        });
+        return;
+      }
+
+      // Files changed — hold for the user's review. The real workspace
+      // has not been touched; the Agent stays "busy" until confirm/discard.
       await this.repository.updateRun(run.id, {
-        status: "completed",
+        status: "pending_confirmation",
         output: result.output,
         usage: result.usage,
+        scan: combinedScan,
+        pendingChanges: { files: changedFiles, truncated: changesTruncated },
         completedAt,
       });
       await this.repository.insertMessage({
@@ -239,12 +422,15 @@ export class AgentService {
         createdAt: completedAt,
       });
       await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
-        status: "ready",
         codexThreadId: result.threadId,
         lastError: null,
         updatedAt: completedAt,
+        // status stays "busy" — waiting on the user's decision.
       });
     } catch (error) {
+      if (handle) {
+        await this.transactions.rollback(handle).catch(() => undefined);
+      }
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
       const message = error instanceof Error ? error.message : String(error);
@@ -290,6 +476,25 @@ export class AgentService {
       }
     } finally {
       this.cancellationRequests.delete(agentId);
+    }
+  }
+
+  private async latestRun(agentId: string): Promise<AgentRun | undefined> {
+    const runs = await this.repository.listRuns(agentId);
+    return runs[0];
+  }
+
+  /** Used when stopping or deleting an Agent that has a proposal still
+   * awaiting review — leaves no orphaned staging directory and no run
+   * stuck forever in "pending_confirmation". */
+  private async discardPendingTransactionIfAny(agent: Agent): Promise<void> {
+    if (!(await this.transactions.hasActive(agent.id))) return;
+    const handle = await this.transactions.begin(agent.id, agent.workspacePath);
+    await this.transactions.rollback(handle);
+    const runs = await this.repository.listRuns(agent.id);
+    const pending = runs.find((run) => run.status === "pending_confirmation");
+    if (pending) {
+      await this.repository.updateRun(pending.id, { status: "discarded", completedAt: now() });
     }
   }
 }

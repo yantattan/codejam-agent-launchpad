@@ -118,7 +118,15 @@ export class JsonAgentRepository implements AgentRepository {
         throw new HttpError(409, "Start the Agent before sending a message");
       }
       if (agent.status === "busy") {
-        throw new HttpError(409, "This Agent is already running");
+        // A follow-up message while a proposal is awaiting confirmation is
+        // a refinement of that same proposal, not a conflicting new task —
+        // everything else still counts as "already running".
+        const latest = database.runs
+          .filter((item) => item.agentId === agentId)
+          .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+        if (latest?.status !== "pending_confirmation") {
+          throw new HttpError(409, "This Agent is already running");
+        }
       }
       const snapshot = structuredClone(agent);
       agent.status = "busy";
@@ -131,7 +139,7 @@ export class JsonAgentRepository implements AgentRepository {
   async resetStaleExecutionState(): Promise<void> {
     await this.store.mutate((database) => {
       for (const run of database.runs) {
-        if (run.status === "queued" || run.status === "running") {
+        if (run.status === "queued" || run.status === "running" || run.status === "pending_confirmation") {
           run.status = "cancelled";
           run.error = "Server restarted while this run was active";
           run.completedAt = now();
