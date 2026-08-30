@@ -1,6 +1,36 @@
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
-export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "blocked";
 export type MessageRole = "user" | "assistant";
+
+export type ScanTargetSource = "prompt" | "workspace-file";
+export type ScanTier = "static" | "semantic";
+export type ScanSeverity = "info" | "suspicious" | "malicious";
+
+export interface ScanFinding {
+  tier: ScanTier;
+  severity: ScanSeverity;
+  /** e.g. "fake-system-message", "zero-width-char", "encoded-instruction",
+   * "semantic-out-of-scope-directive" */
+  technique: string;
+  source: ScanTargetSource;
+  path?: string;
+  excerpt: string;
+  detail: string;
+}
+
+export interface ScanVerdict {
+  blocked: boolean;
+  findings: ScanFinding[];
+  scannedAt: string;
+  /** True if the scan hit a size/count cap and skipped some content. */
+  truncated?: boolean;
+}
 
 export interface Agent {
   id: string;
@@ -41,6 +71,7 @@ export interface AgentRun {
   startedAt: string | null;
   completedAt: string | null;
   createdAt: string;
+  scan: ScanVerdict | null;
 }
 
 export interface Database {

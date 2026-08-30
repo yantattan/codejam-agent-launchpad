@@ -824,6 +824,89 @@ textarea:focus {
   font-size: 11px;
 }
 
+.scan-findings {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.scan-findings li {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.scan-findings strong {
+  display: block;
+  font-size: 11px;
+}
+
+.scan-findings p {
+  margin: 2px 0;
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.scan-findings code {
+  display: block;
+  font-size: 9px;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 5px;
+  padding: 4px 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.scan-severity {
+  flex: none;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.scan-severity-info {
+  background: #e5e4df;
+  color: #666760;
+}
+
+.scan-severity-suspicious {
+  background: #fff2c6;
+  color: #8a6a17;
+}
+
+.scan-severity-malicious {
+  background: #f6dfdc;
+  color: #ac4343;
+}
+
+.scan-summary {
+  max-width: 1180px;
+  margin: 0 auto 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--green);
+}
+
+.scan-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border-left: 2px solid #bc9239;
+  background: #fff7d8;
+  padding: 10px 12px;
+  color: #6c541b;
+  font-size: 11px;
+}
+
 .composer {
   margin: 0;
   border-top: 1px solid #e1dfd8;

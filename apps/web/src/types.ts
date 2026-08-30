@@ -1,5 +1,30 @@
 export type AgentStatus = "ready" | "busy" | "stopped" | "error";
-export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type RunStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "blocked";
+
+export type ScanSeverity = "info" | "suspicious" | "malicious";
+
+export interface ScanFinding {
+  tier: "static" | "semantic";
+  severity: ScanSeverity;
+  technique: string;
+  source: "prompt" | "workspace-file";
+  path?: string;
+  excerpt: string;
+  detail: string;
+}
+
+export interface ScanVerdict {
+  blocked: boolean;
+  findings: ScanFinding[];
+  scannedAt: string;
+  truncated?: boolean;
+}
 
 export interface Agent {
   id: string;
@@ -36,6 +61,7 @@ export interface AgentRun {
     outputTokens?: number;
   } | null;
   createdAt: string;
+  scan: ScanVerdict | null;
 }
 
 export interface SystemInfo {

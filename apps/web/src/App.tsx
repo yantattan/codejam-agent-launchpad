@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
-import type { Agent, AgentRun, Message, SystemInfo } from "./types";
+import type { Agent, AgentRun, Message, ScanFinding, ScanVerdict, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -33,6 +33,45 @@ function StatusPill({ status }: { status: Agent["status"] }) {
 
 function Spinner() {
   return <span className="spinner" aria-label="Loading" />;
+}
+
+function ScanFindingsList({ findings }: { findings: ScanFinding[] }) {
+  if (findings.length === 0) return null;
+  return (
+    <ul className="scan-findings">
+      {findings.map((finding, index) => (
+        <li key={index}>
+          <span className={"scan-severity scan-severity-" + finding.severity}>
+            {finding.severity}
+          </span>
+          <div>
+            <strong>
+              {finding.technique}
+              {finding.path ? " · " + finding.path : ""}
+            </strong>
+            <p>{finding.detail}</p>
+            <code>{finding.excerpt}</code>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function ScanSummary({ scan }: { scan: ScanVerdict }) {
+  if (scan.findings.length === 0) {
+    return (
+      <div className="scan-summary scan-summary-clean">
+        <span>✓</span> Injection scan: prompt and workspace files scanned, nothing found.
+      </div>
+    );
+  }
+  return (
+    <article className="scan-warning">
+      <strong>Injection scan flagged {scan.findings.length} item(s) — run proceeded</strong>
+      <ScanFindingsList findings={scan.findings} />
+    </article>
+  );
 }
 
 export default function App() {
@@ -537,6 +576,16 @@ export default function App() {
                     <strong>Run failed</strong>
                     <span>{activeRun.error}</span>
                   </article>
+                )}
+                {activeRun?.status === "blocked" && (
+                  <article className="run-error scan-blocked">
+                    <strong>Blocked — potential prompt injection detected</strong>
+                    <span>Codex never started. The instruction never reached the model.</span>
+                    <ScanFindingsList findings={activeRun.scan?.findings ?? []} />
+                  </article>
+                )}
+                {activeRun?.status === "completed" && activeRun.scan && (
+                  <ScanSummary scan={activeRun.scan} />
                 )}
                 <div ref={messageEnd} />
               </div>

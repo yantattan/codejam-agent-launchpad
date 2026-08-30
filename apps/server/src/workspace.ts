@@ -1,6 +1,17 @@
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Agent } from "./types.js";
+
+export interface ScannableFile {
+  /** Relative to the Agent's workspace root, forward-slash separated. */
+  path: string;
+  content: string;
+}
+
+const SKIP_DIR_NAMES = new Set([".git", ".codex", "node_modules", "dist", ".deleted"]);
+const DEFAULT_MAX_FILES = 200;
+const DEFAULT_MAX_BYTES_PER_FILE = 256 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES = 2 * 1024 * 1024;
 
 export class WorkspaceManager {
   constructor(private readonly root: string) {}
@@ -60,6 +71,75 @@ export class WorkspaceManager {
       .filter((line, index, lines) => !(line === "" && lines[index - 1] === ""))
       .join("\n");
     await writeFile(path.join(agent.workspacePath, "AGENTS.md"), content, "utf8");
+  }
+
+  /**
+   * Reads every non-binary file currently in the Agent's workspace, bounded
+   * by count/size caps — this is exactly what Codex is about to read this
+   * turn, scanned before it does. Read errors on individual entries are
+   * skipped rather than failing the whole scan.
+   */
+  async readScannableFiles(
+    agent: Agent,
+    opts: { maxFiles?: number; maxBytesPerFile?: number; maxTotalBytes?: number } = {},
+  ): Promise<{ files: ScannableFile[]; truncated: boolean }> {
+    const maxFiles = opts.maxFiles ?? DEFAULT_MAX_FILES;
+    const maxBytesPerFile = opts.maxBytesPerFile ?? DEFAULT_MAX_BYTES_PER_FILE;
+    const maxTotalBytes = opts.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
+
+    const files: ScannableFile[] = [];
+    let totalBytes = 0;
+    let truncated = false;
+
+    const withinBudget = () => files.length < maxFiles && totalBytes < maxTotalBytes;
+
+    const walk = async (dir: string): Promise<void> => {
+      if (!withinBudget()) {
+        truncated = true;
+        return;
+      }
+      let entries;
+      try {
+        entries = await readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (!withinBudget()) {
+          truncated = true;
+          return;
+        }
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (SKIP_DIR_NAMES.has(entry.name)) continue;
+          await walk(fullPath);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        let fileStat;
+        try {
+          fileStat = await stat(fullPath);
+        } catch {
+          continue;
+        }
+        if (fileStat.size === 0 || fileStat.size > maxBytesPerFile) continue;
+        let buffer;
+        try {
+          buffer = await readFile(fullPath);
+        } catch {
+          continue;
+        }
+        if (buffer.subarray(0, 512).includes(0)) continue; // binary sniff
+        totalBytes += buffer.byteLength;
+        files.push({
+          path: path.relative(agent.workspacePath, fullPath).split(path.sep).join("/"),
+          content: buffer.toString("utf8"),
+        });
+      }
+    };
+
+    await walk(agent.workspacePath);
+    return { files, truncated };
   }
 
   async archive(agent: Agent): Promise<string> {

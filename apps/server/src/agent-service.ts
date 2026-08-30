@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
+import type { InjectionScanner } from "./injection-scanner.js";
 import { JsonStore } from "./store.js";
 import type {
   Agent,
@@ -9,11 +10,29 @@ import type {
   AgentRunner,
   CreateAgentInput,
   Message,
+  ScanVerdict,
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
 
 const now = () => new Date().toISOString();
+
+function describeScan(verdict: ScanVerdict): string {
+  const blocking = verdict.findings.filter((item) => item.severity === "malicious");
+  const list = (blocking.length > 0 ? blocking : verdict.findings).slice(0, 3);
+  return list
+    .map(
+      (item) =>
+        (item.path ? "[" + item.path + "] " : "") +
+        item.technique +
+        ": " +
+        item.detail +
+        ' — "' +
+        item.excerpt +
+        '"',
+    )
+    .join(" | ");
+}
 
 export class AgentService {
   private readonly activeExecutions = new Map<string, Promise<void>>();
@@ -24,6 +43,7 @@ export class AgentService {
     private readonly store: JsonStore,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
+    private readonly scanner: InjectionScanner,
   ) {}
 
   async initialize(): Promise<void> {
@@ -160,6 +180,15 @@ export class AgentService {
         "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
       );
     }
+    const agent = this.getAgent(agentId);
+    const promptScan = await this.scanner.scan(agent, [{ source: "prompt", text: prompt }]);
+    if (promptScan.blocked) {
+      throw new HttpError(
+        422,
+        "Blocked: potential prompt injection detected. " + describeScan(promptScan),
+      );
+    }
+
     const timestamp = now();
     const runId = randomUUID();
     const run: AgentRun = {
@@ -173,6 +202,7 @@ export class AgentService {
       startedAt: null,
       completedAt: null,
       createdAt: timestamp,
+      scan: promptScan,
     };
     const message: Message = {
       id: randomUUID(),
@@ -201,7 +231,7 @@ export class AgentService {
       storedAgent.updatedAt = timestamp;
       return snapshot;
     });
-    const execution = this.executeRun(agentAtStart, run);
+    const execution = this.executeRun(agentAtStart, run, promptScan);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
@@ -232,7 +262,11 @@ export class AgentService {
     };
   }
 
-  private async executeRun(agentAtStart: Agent, run: AgentRun): Promise<void> {
+  private async executeRun(
+    agentAtStart: Agent,
+    run: AgentRun,
+    promptScan: ScanVerdict,
+  ): Promise<void> {
     await this.store.mutate((database) => {
       const storedRun = database.runs.find((item) => item.id === run.id);
       if (storedRun) {
@@ -244,6 +278,46 @@ export class AgentService {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
+
+      // Scan the workspace on every turn (including resumed threads) —
+      // this is what Codex is about to read this turn, and catches content
+      // that arrived after the Agent was created (a file added between
+      // turns, or by a prior turn's own output).
+      const { files, truncated: filesTruncated } = await this.workspaces.readScannableFiles(
+        agentAtStart,
+      );
+      const fileScan = await this.scanner.scan(
+        agentAtStart,
+        files.map((file) => ({ source: "workspace-file" as const, path: file.path, text: file.content })),
+      );
+      const combinedScan: ScanVerdict = {
+        blocked: promptScan.blocked || fileScan.blocked,
+        findings: [...promptScan.findings, ...fileScan.findings],
+        scannedAt: now(),
+        ...((promptScan.truncated ?? false) || (fileScan.truncated ?? false) || filesTruncated
+          ? { truncated: true }
+          : {}),
+      };
+
+      if (combinedScan.blocked) {
+        const completedAt = now();
+        await this.store.mutate((database) => {
+          const storedRun = database.runs.find((item) => item.id === run.id);
+          const agent = database.agents.find((item) => item.id === agentAtStart.id);
+          if (storedRun) {
+            storedRun.status = "blocked";
+            storedRun.scan = combinedScan;
+            storedRun.error = "Blocked by prompt-injection scan: " + describeScan(combinedScan);
+            storedRun.completedAt = completedAt;
+          }
+          if (agent && agent.status !== "stopped") {
+            agent.status = "ready";
+            agent.updatedAt = completedAt;
+          }
+        });
+        return;
+      }
+
       const result = await this.runner.run({
         agentId: agentAtStart.id,
         workspacePath: agentAtStart.workspacePath,
@@ -258,6 +332,7 @@ export class AgentService {
         storedRun.status = "completed";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
+        storedRun.scan = combinedScan;
         storedRun.completedAt = completedAt;
         database.messages.push({
           id: randomUUID(),
