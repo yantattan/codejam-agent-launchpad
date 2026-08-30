@@ -68,18 +68,37 @@ cd volc-agent-launchpad
 
 Skip this step when already working from the repository root.
 
-### 3. Start the POC
+### 3. Configure environment
 
 ```bash
-ARK_API_KEY=your-ark-api-key \
-ARK_MODEL=ep-your-endpoint-id \
+cp .env.example .env
+```
+
+Edit `.env` and fill in:
+
+- `ARK_API_KEY` / `ARK_MODEL` — your own Ark credentials.
+- `SUPABASE_URL` / `SUPABASE_ANON_KEY` / the matching `VITE_` copies — **your
+  own** free Supabase project (create one at [supabase.com](https://supabase.com),
+  values are under Settings > API). This is required — the app is gated
+  behind sign-in, and every reviewer needs their own project for this, the
+  same way everyone needs their own Ark key. See
+  [Authentication](#authentication-supabase) for the two-minute setup.
+- `SUPABASE_SERVICE_ROLE_KEY` — optional, leave blank. Only needed if you
+  also want Agents/chat history to persist in Postgres instead of a local
+  file; see [Data persistence](#data-persistence-supabase). Nothing below
+  requires this.
+
+### 4. Start the POC
+
+```bash
 npm run poc
 ```
 
 The first run installs Node.js dependencies and builds the Runtime image. The
-script automatically selects Docker, Colima, or Podman.
+script automatically selects Docker, Colima, or Podman, and reads the
+credentials from `.env`.
 
-### 4. Open the browser
+### 5. Open the browser
 
 Visit <http://localhost:3000>, or open it from the terminal:
 
@@ -90,10 +109,11 @@ xdg-open http://localhost:3000   # Linux desktop
 
 In the Web UI:
 
-1. Select **Create Agent**.
-2. Enter a name, description, and workspace instructions.
-3. Select **Create Agent** again.
-4. Enter a task in the Playground, for example:
+1. Sign up with an email and password (the Supabase project from step 3).
+2. Select **Create Agent**.
+3. Enter a name, description, and workspace instructions.
+4. Select **Create Agent** again.
+5. Enter a task in the Playground, for example:
 
    ```text
    Create a TypeScript hello-world CLI, add a test, and run it.
@@ -102,7 +122,7 @@ In the Web UI:
 The Agent can write files, run commands, and continue the same Codex session in
 later messages.
 
-### 5. Stop and resume
+### 6. Stop and resume
 
 Press `Ctrl+C` in the startup terminal. The script removes temporary Runtime
 containers but keeps Agent workspaces and conversations.
@@ -115,13 +135,11 @@ Run the same `npm run poc` command to continue later.
 
 ### Select a specific container engine
 
-Force Podman when multiple engines are installed:
+Force Podman when multiple engines are installed (credentials still come
+from `.env`):
 
 ```bash
-CONTAINER_ENGINE=podman \
-ARK_API_KEY=your-ark-api-key \
-ARK_MODEL=ep-your-endpoint-id \
-npm run poc
+CONTAINER_ENGINE=podman npm run poc
 ```
 
 Colima uses `CONTAINER_ENGINE=docker` because it exposes the Docker CLI.
@@ -142,7 +160,16 @@ Required values in `.env`:
 ```dotenv
 ARK_API_KEY=your-ark-api-key
 ARK_MODEL=ep-your-endpoint-id
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_ANON_KEY=your-anon-key
+VITE_SUPABASE_URL=https://your-project-ref.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key
 ```
+
+The `VITE_` pair must be set *before* the build — Vite bakes them into the
+browser bundle at build time, so `docker compose up --build` reads them from
+`.env` as build args, not as a running-container env var. Changing them
+later needs a rebuild, not just a restart.
 
 Start the application:
 
