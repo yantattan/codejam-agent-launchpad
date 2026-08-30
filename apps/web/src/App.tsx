@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, setAuthToken, setUnauthorizedHandler } from "./api";
+import { api, setSupabaseToken, setUnauthorizedHandler } from "./api";
+import Login from "./Login";
+import { supabase, supabaseConfigured, type Session } from "./supabaseClient";
 import type { Agent, AgentRun, FileChange, Message, ScanFinding, ScanVerdict, SystemInfo } from "./types";
 
 const starterPrompts = [
@@ -259,8 +261,8 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [authRequired, setAuthRequired] = useState<boolean | null>(null);
-  const [authInput, setAuthInput] = useState("");
+  const [session, setSession] = useState<Session | null>(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -295,28 +297,49 @@ export default function App() {
 
   useEffect(() => {
     setUnauthorizedHandler(() => {
-      setAuthToken("");
-      setAuthRequired(true);
-      setAuthInput("");
       setActiveRun(null);
       setError("Your session expired — please sign in again.");
+      // Clears the local Supabase session too (not just this component's
+      // state), so the app doesn't immediately bounce back in with the
+      // same now-rejected token — this drops straight to the Login screen
+      // via the `!session` branch below, through onAuthStateChange.
+      if (supabase) void supabase.auth.signOut();
     });
   }, []);
 
   useEffect(() => {
     mountedRef.current = true;
-    void api
-      .auth()
-      .then(async ({ required }) => {
-        if (!mountedRef.current) return;
-        setAuthRequired(required);
-        if (!required) await bootstrap();
-      })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
     return () => {
       mountedRef.current = false;
     };
-  }, [bootstrap]);
+  }, []);
+
+  useEffect(() => {
+    if (!supabaseConfigured || !supabase) {
+      setSessionChecked(true);
+      return;
+    }
+    void supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setSessionChecked(true);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+    });
+    return () => listener.subscription.unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    setSupabaseToken(session?.access_token ?? "");
+    if (session) {
+      void bootstrap().catch((reason) =>
+        setError(reason instanceof Error ? reason.message : String(reason)),
+      );
+    } else {
+      setAgents([]);
+      setSelectedId(null);
+    }
+  }, [session, bootstrap]);
 
   useEffect(() => {
     setActiveRun(null);
@@ -500,65 +523,26 @@ export default function App() {
     }
   };
 
-  const unlock = async (event: React.FormEvent) => {
-    event.preventDefault();
-    setBusy(true);
-    setError(null);
-    setAuthToken(authInput);
-    try {
-      await bootstrap();
-      setAuthRequired(false);
-      setAuthInput("");
-    } catch (reason) {
-      if (reason instanceof ApiError && reason.status === 401) {
-        setError("The access token is not valid.");
-      } else {
-        setError(reason instanceof Error ? reason.message : String(reason));
-      }
-    } finally {
-      setBusy(false);
-    }
+  const signOut = async () => {
+    if (!supabase) return;
+    await supabase.auth.signOut();
   };
 
-  if (authRequired === null) {
+  if (!sessionChecked) {
     return (
       <main className="auth-screen">
         <section className="auth-card" aria-live="polite">
           <div className="brand-mark">A</div>
           <span className="eyebrow">Agent Launchpad</span>
-          <h1>Connecting to the control plane</h1>
-          {error ? <div className="error-banner" role="alert">{error}</div> : <Spinner />}
+          <h1>Checking your session</h1>
+          <Spinner />
         </section>
       </main>
     );
   }
 
-  if (authRequired) {
-    return (
-      <main className="auth-screen">
-        <form className="auth-card" onSubmit={unlock}>
-          <div className="brand-mark">A</div>
-          <span className="eyebrow">Agent Launchpad</span>
-          <h1>Enter the access token</h1>
-          <p>This shared demo token is configured by the platform operator.</p>
-          {error && <div className="error-banner" role="alert">{error}</div>}
-          <label>
-            Access token
-            <input
-              autoFocus
-              type="password"
-              value={authInput}
-              onChange={(event) => setAuthInput(event.target.value)}
-              autoComplete="current-password"
-              required
-            />
-          </label>
-          <button className="button button-primary" disabled={busy || !authInput.trim()}>
-            {busy ? <Spinner /> : "Open Launchpad"}
-          </button>
-        </form>
-      </main>
-    );
+  if (!session) {
+    return <Login />;
   }
 
   return (
@@ -573,6 +557,20 @@ export default function App() {
                 ? "Local container · Codex CLI"
                 : "ECS / Docker · Codex CLI"}
             </span>
+          </div>
+        </div>
+
+        <div className="user-card">
+          <div className="user-avatar">
+            {(session.user.email ?? "?").slice(0, 1).toUpperCase()}
+          </div>
+          <div className="user-meta">
+            <span className="user-email" title={session.user.email ?? undefined}>
+              {session.user.email}
+            </span>
+            <button className="user-signout" onClick={() => void signOut()}>
+              Sign out
+            </button>
           </div>
         </div>
 

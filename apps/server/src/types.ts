@@ -36,6 +36,7 @@ export interface ScanVerdict {
 
 export interface Agent {
   id: string;
+  ownerId: string;
   name: string;
   description: string;
   instructions: string;

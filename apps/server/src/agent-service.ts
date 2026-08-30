@@ -3,7 +3,7 @@ import type { AppConfig } from "./config.js";
 import { isArkConfigured } from "./config.js";
 import { HttpError, RunCancelledError } from "./errors.js";
 import type { InjectionScanner } from "./injection-scanner.js";
-import { JsonStore } from "./store.js";
+import type { AgentRepository, PersistedAgent } from "./repository.js";
 import type {
   Agent,
   AgentRun,
@@ -41,7 +41,7 @@ export class AgentService {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly store: JsonStore,
+    private readonly repository: AgentRepository,
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
     private readonly scanner: InjectionScanner,
@@ -49,107 +49,88 @@ export class AgentService {
   ) {}
 
   async initialize(): Promise<void> {
-    await this.store.initialize();
+    await this.repository.initialize();
     await this.workspaces.initialize();
     await this.transactions.initialize();
-    await this.store.mutate((database) => {
-      for (const run of database.runs) {
-        if (run.status === "queued" || run.status === "running" || run.status === "pending_confirmation") {
-          run.status = "cancelled";
-          run.error = "Server restarted while this run was active";
-          run.completedAt = now();
-        }
-      }
-      for (const agent of database.agents) {
-        if (agent.status === "busy") {
-          agent.status = "ready";
-          agent.updatedAt = now();
-        }
-      }
-    });
+    await this.repository.resetStaleExecutionState();
     await this.transactions.cleanupStale();
   }
 
-  listAgents(): Agent[] {
-    return this.store
-      .snapshot()
-      .agents.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  private toPublicAgent(agent: PersistedAgent): Agent {
+    return { ...agent, workspacePath: this.workspaces.workspacePath(agent.id) };
   }
 
-  getAgent(id: string): Agent {
-    const agent = this.store.snapshot().agents.find((item) => item.id === id);
+  async listAgents(ownerId: string): Promise<Agent[]> {
+    const agents = await this.repository.listAgents(ownerId);
+    return agents.map((agent) => this.toPublicAgent(agent));
+  }
+
+  async getAgent(id: string, ownerId: string): Promise<Agent> {
+    const agent = await this.repository.getAgent(id, ownerId);
     if (!agent) {
       throw new HttpError(404, "Agent not found");
     }
-    return agent;
+    return this.toPublicAgent(agent);
   }
 
-  async createAgent(input: CreateAgentInput): Promise<Agent> {
+  async createAgent(input: CreateAgentInput, ownerId: string): Promise<Agent> {
     const timestamp = now();
     const id = randomUUID();
-    const agent: Agent = {
+    const persisted: PersistedAgent = {
       id,
+      ownerId,
       name: input.name.trim(),
       description: input.description?.trim() ?? "",
       instructions: input.instructions?.trim() ?? "",
       status: "ready",
-      workspacePath: this.workspaces.workspacePath(id),
       codexThreadId: null,
       lastError: null,
       createdAt: timestamp,
       updatedAt: timestamp,
     };
+    const agent = this.toPublicAgent(persisted);
     await this.workspaces.create(agent);
-    await this.store.mutate((database) => database.agents.push(agent));
+    await this.repository.insertAgent(persisted);
     return agent;
   }
 
-  async updateAgent(id: string, input: UpdateAgentInput): Promise<Agent> {
-    const current = this.getAgent(id);
+  async updateAgent(id: string, input: UpdateAgentInput, ownerId: string): Promise<Agent> {
+    const current = await this.getAgent(id, ownerId);
     if (current.status === "busy") {
       throw new HttpError(409, "Stop the active run before editing this Agent");
     }
-    const updated = await this.store.mutate((database) => {
-      const agent = database.agents.find((item) => item.id === id);
-      if (!agent) {
-        throw new HttpError(404, "Agent not found");
-      }
-      if (agent.status === "busy") {
-        throw new HttpError(409, "Stop the active run before editing this Agent");
-      }
-      if (input.name !== undefined) agent.name = input.name.trim();
-      if (input.description !== undefined) agent.description = input.description.trim();
-      if (input.instructions !== undefined) agent.instructions = input.instructions.trim();
-      agent.lastError = null;
-      agent.updatedAt = now();
-      return structuredClone(agent);
-    });
-    await this.workspaces.writeInstructions(updated);
-    return updated;
+    const patch: Partial<PersistedAgent> = { lastError: null, updatedAt: now() };
+    if (input.name !== undefined) patch.name = input.name.trim();
+    if (input.description !== undefined) patch.description = input.description.trim();
+    if (input.instructions !== undefined) patch.instructions = input.instructions.trim();
+    const updated = await this.repository.updateAgent(id, ownerId, patch);
+    if (!updated) {
+      throw new HttpError(404, "Agent not found");
+    }
+    const agent = this.toPublicAgent(updated);
+    await this.workspaces.writeInstructions(agent);
+    return agent;
   }
 
-  async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
-    const agent = this.getAgent(id);
+  async deleteAgent(id: string, ownerId: string): Promise<{ archivedWorkspace: string | null }> {
+    const agent = await this.getAgent(id, ownerId);
     await this.cancelExecution(id);
-    await this.discardPendingTransactionIfAny(id);
+    await this.discardPendingTransactionIfAny(agent);
     const archivedWorkspace = await this.workspaces.archive(agent);
-    await this.store.mutate((database) => {
-      database.agents = database.agents.filter((item) => item.id !== id);
-      database.messages = database.messages.filter((item) => item.agentId !== id);
-      database.runs = database.runs.filter((item) => item.agentId !== id);
-    });
+    await this.repository.deleteAgent(id, ownerId);
     return { archivedWorkspace };
   }
 
-  async startAgent(id: string): Promise<Agent> {
-    return this.setStatus(id, "ready");
+  async startAgent(id: string, ownerId: string): Promise<Agent> {
+    await this.getAgent(id, ownerId);
+    return this.setStatus(id, ownerId, "ready");
   }
 
-  async stopAgent(id: string): Promise<Agent> {
-    this.getAgent(id);
+  async stopAgent(id: string, ownerId: string): Promise<Agent> {
+    const agent = await this.getAgent(id, ownerId);
     await this.cancelExecution(id);
-    await this.discardPendingTransactionIfAny(id);
-    return this.setStatus(id, "stopped");
+    await this.discardPendingTransactionIfAny(agent);
+    return this.setStatus(id, ownerId, "stopped");
   }
 
   /**
@@ -158,93 +139,77 @@ export class AgentService {
    * refinement has already produced a newer pending run for this Agent,
    * that newer one is the only one still backed by a live staging copy.
    */
-  async confirmRun(runId: string): Promise<AgentRun> {
-    const run = this.getRun(runId);
-    const agent = this.getAgent(run.agentId);
+  async confirmRun(runId: string, ownerId: string): Promise<AgentRun> {
+    const run = await this.getRun(runId, ownerId);
+    const agent = await this.getAgent(run.agentId, ownerId);
     if (run.status !== "pending_confirmation") {
       throw new HttpError(409, "This run is not awaiting confirmation");
     }
-    if (this.latestRun(agent.id)?.id !== run.id) {
+    if ((await this.latestRun(agent.id))?.id !== run.id) {
       throw new HttpError(409, "This proposal has been superseded by a newer one");
     }
     const handle = await this.transactions.begin(agent.id, agent.workspacePath);
     await this.transactions.commit(handle);
-    return this.store.mutate((database) => {
-      const storedRun = database.runs.find((item) => item.id === runId);
-      const storedAgent = database.agents.find((item) => item.id === agent.id);
-      if (!storedRun) {
-        throw new HttpError(404, "Run not found");
-      }
-      const completedAt = now();
-      storedRun.status = "completed";
-      storedRun.completedAt = completedAt;
-      if (storedAgent && storedAgent.status !== "stopped") {
-        storedAgent.status = "ready";
-        storedAgent.updatedAt = completedAt;
-      }
-      return structuredClone(storedRun);
-    });
+    const completedAt = now();
+    const updated = await this.repository.updateRun(runId, { status: "completed", completedAt });
+    if (!updated) {
+      throw new HttpError(404, "Run not found");
+    }
+    if (agent.status !== "stopped") {
+      await this.repository.updateAgent(agent.id, ownerId, { status: "ready", updatedAt: completedAt });
+    }
+    return updated;
   }
 
   /**
    * Discards a pending proposal: the staged copy is deleted, the real
    * workspace was never touched. Same staleness guard as confirmRun.
    */
-  async discardRun(runId: string): Promise<AgentRun> {
-    const run = this.getRun(runId);
-    const agent = this.getAgent(run.agentId);
+  async discardRun(runId: string, ownerId: string): Promise<AgentRun> {
+    const run = await this.getRun(runId, ownerId);
+    const agent = await this.getAgent(run.agentId, ownerId);
     if (run.status !== "pending_confirmation") {
       throw new HttpError(409, "This run is not awaiting confirmation");
     }
-    if (this.latestRun(agent.id)?.id !== run.id) {
+    if ((await this.latestRun(agent.id))?.id !== run.id) {
       throw new HttpError(409, "This proposal has been superseded by a newer one");
     }
     const handle = await this.transactions.begin(agent.id, agent.workspacePath);
     await this.transactions.rollback(handle);
-    return this.store.mutate((database) => {
-      const storedRun = database.runs.find((item) => item.id === runId);
-      const storedAgent = database.agents.find((item) => item.id === agent.id);
-      if (!storedRun) {
-        throw new HttpError(404, "Run not found");
-      }
-      const completedAt = now();
-      storedRun.status = "discarded";
-      storedRun.completedAt = completedAt;
-      if (storedAgent && storedAgent.status !== "stopped") {
-        storedAgent.status = "ready";
-        storedAgent.updatedAt = completedAt;
-      }
-      return structuredClone(storedRun);
-    });
+    const completedAt = now();
+    const updated = await this.repository.updateRun(runId, { status: "discarded", completedAt });
+    if (!updated) {
+      throw new HttpError(404, "Run not found");
+    }
+    if (agent.status !== "stopped") {
+      await this.repository.updateAgent(agent.id, ownerId, { status: "ready", updatedAt: completedAt });
+    }
+    return updated;
   }
 
-  getMessages(agentId: string): Message[] {
-    this.getAgent(agentId);
-    return this.store
-      .snapshot()
-      .messages.filter((message) => message.agentId === agentId)
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  async getMessages(agentId: string, ownerId: string): Promise<Message[]> {
+    await this.getAgent(agentId, ownerId);
+    return this.repository.listMessages(agentId);
   }
 
-  getRun(runId: string): AgentRun {
-    const run = this.store.snapshot().runs.find((item) => item.id === runId);
+  async getRun(runId: string, ownerId: string): Promise<AgentRun> {
+    const run = await this.repository.getRun(runId);
     if (!run) {
       throw new HttpError(404, "Run not found");
     }
+    await this.getAgent(run.agentId, ownerId);
     return run;
   }
 
-  getRuns(agentId: string): AgentRun[] {
-    this.getAgent(agentId);
-    return this.store
-      .snapshot()
-      .runs.filter((run) => run.agentId === agentId)
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  async getRuns(agentId: string, ownerId: string): Promise<AgentRun[]> {
+    await this.getAgent(agentId, ownerId);
+    return this.repository.listRuns(agentId);
   }
 
   async sendMessage(
     agentId: string,
     prompt: string,
+    ownerId: string,
   ): Promise<{ run: AgentRun; message: Message }> {
     if (!isArkConfigured(this.config)) {
       throw new HttpError(
@@ -252,13 +217,18 @@ export class AgentService {
         "Ark is not configured. Set ARK_API_KEY and ARK_MODEL, then restart.",
       );
     }
-    const agent = this.getAgent(agentId);
+    const agent = await this.getAgent(agentId, ownerId);
     const promptScan = await this.scanner.scan(agent, [{ source: "prompt", text: prompt }]);
     if (promptScan.blocked) {
       throw new HttpError(
         422,
         "Blocked: potential prompt injection detected. " + describeScan(promptScan),
       );
+    }
+
+    const agentAtStart = await this.repository.beginRun(agentId, ownerId);
+    if (!agentAtStart) {
+      throw new HttpError(404, "Agent not found");
     }
 
     const timestamp = now();
@@ -285,34 +255,10 @@ export class AgentService {
       content: prompt,
       createdAt: timestamp,
     };
-    const agentAtStart = await this.store.mutate((database) => {
-      const storedAgent = database.agents.find((item) => item.id === agentId);
-      if (!storedAgent) {
-        throw new HttpError(404, "Agent not found");
-      }
-      if (storedAgent.status === "stopped") {
-        throw new HttpError(409, "Start the Agent before sending a message");
-      }
-      if (storedAgent.status === "busy") {
-        // A follow-up message while a proposal is awaiting confirmation is
-        // a refinement of that same proposal, not a conflicting new task —
-        // everything else still counts as "already running".
-        const latest = database.runs
-          .filter((item) => item.agentId === agentId)
-          .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
-        if (latest?.status !== "pending_confirmation") {
-          throw new HttpError(409, "This Agent is already running");
-        }
-      }
-      database.runs.push(run);
-      database.messages.push(message);
-      const snapshot = structuredClone(storedAgent);
-      storedAgent.status = "busy";
-      storedAgent.lastError = null;
-      storedAgent.updatedAt = timestamp;
-      return snapshot;
-    });
-    const execution = this.executeRun(agentAtStart, run, promptScan);
+    await this.repository.insertRun(run);
+    await this.repository.insertMessage(message);
+
+    const execution = this.executeRun(this.toPublicAgent(agentAtStart), run, promptScan);
     this.activeExecutions.set(agentId, execution);
     void execution
       .finally(() => {
@@ -343,18 +289,22 @@ export class AgentService {
     };
   }
 
-  private async executeRun(
-    agentAtStart: Agent,
-    run: AgentRun,
-    promptScan: ScanVerdict,
-  ): Promise<void> {
-    await this.store.mutate((database) => {
-      const storedRun = database.runs.find((item) => item.id === run.id);
-      if (storedRun) {
-        storedRun.status = "running";
-        storedRun.startedAt = now();
-      }
-    });
+  private async executeRun(agentAtStart: Agent, run: AgentRun, promptScan: ScanVerdict): Promise<void> {
+    await this.repository.updateRun(run.id, { status: "running", startedAt: now() });
+
+    // An Agent synced from another machine has no local workspace or Codex
+    // session yet. Provision one now and start a fresh Codex session rather
+    // than trying (and failing) to resume a thread that only ever existed
+    // on the machine that created it.
+    let threadId = agentAtStart.codexThreadId;
+    if (!(await this.workspaces.exists(agentAtStart.id))) {
+      await this.workspaces.create(agentAtStart);
+      threadId = null;
+      await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
+        codexThreadId: null,
+      });
+    }
+
     let handle: TransactionHandle | null = null;
     try {
       if (this.cancellationRequests.has(agentAtStart.id)) {
@@ -398,20 +348,19 @@ export class AgentService {
         // staged waiting for a later confirm.
         await this.transactions.rollback(handle);
         const completedAt = now();
-        await this.store.mutate((database) => {
-          const storedRun = database.runs.find((item) => item.id === run.id);
-          const agent = database.agents.find((item) => item.id === agentAtStart.id);
-          if (storedRun) {
-            storedRun.status = "blocked";
-            storedRun.scan = combinedScan;
-            storedRun.error = "Blocked by prompt-injection scan: " + describeScan(combinedScan);
-            storedRun.completedAt = completedAt;
-          }
-          if (agent && agent.status !== "stopped") {
-            agent.status = "ready";
-            agent.updatedAt = completedAt;
-          }
+        await this.repository.updateRun(run.id, {
+          status: "blocked",
+          scan: combinedScan,
+          error: "Blocked by prompt-injection scan: " + describeScan(combinedScan),
+          completedAt,
         });
+        const latest = await this.repository.getAgent(agentAtStart.id, agentAtStart.ownerId);
+        if (latest && latest.status !== "stopped") {
+          await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
+            status: "ready",
+            updatedAt: completedAt,
+          });
+        }
         return;
       }
 
@@ -419,7 +368,7 @@ export class AgentService {
         agentId: agentAtStart.id,
         workspacePath: handle.workingPath,
         prompt: run.prompt,
-        threadId: agentAtStart.codexThreadId,
+        threadId,
       });
 
       const { files: changedFiles, truncated: changesTruncated } = await this.transactions.diffChanges(handle);
@@ -429,55 +378,54 @@ export class AgentService {
         // Nothing to review — commit is a same-content swap, so this stays
         // as frictionless as a plain Q&A turn always was.
         await this.transactions.commit(handle);
-        await this.store.mutate((database) => {
-          const storedRun = database.runs.find((item) => item.id === run.id);
-          const agent = database.agents.find((item) => item.id === agentAtStart.id);
-          if (!storedRun || !agent) return;
-          storedRun.status = "completed";
-          storedRun.output = result.output;
-          storedRun.usage = result.usage;
-          storedRun.scan = combinedScan;
-          storedRun.pendingChanges = null;
-          storedRun.completedAt = completedAt;
-          database.messages.push({
-            id: randomUUID(),
-            agentId: agent.id,
-            runId: run.id,
-            role: "assistant",
-            content: result.output,
-            createdAt: completedAt,
-          });
-          agent.status = "ready";
-          agent.codexThreadId = result.threadId;
-          agent.lastError = null;
-          agent.updatedAt = completedAt;
+        await this.repository.updateRun(run.id, {
+          status: "completed",
+          output: result.output,
+          usage: result.usage,
+          scan: combinedScan,
+          pendingChanges: null,
+          completedAt,
+        });
+        await this.repository.insertMessage({
+          id: randomUUID(),
+          agentId: agentAtStart.id,
+          runId: run.id,
+          role: "assistant",
+          content: result.output,
+          createdAt: completedAt,
+        });
+        await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
+          status: "ready",
+          codexThreadId: result.threadId,
+          lastError: null,
+          updatedAt: completedAt,
         });
         return;
       }
 
       // Files changed — hold for the user's review. The real workspace
       // has not been touched; the Agent stays "busy" until confirm/discard.
-      await this.store.mutate((database) => {
-        const storedRun = database.runs.find((item) => item.id === run.id);
-        const agent = database.agents.find((item) => item.id === agentAtStart.id);
-        if (!storedRun || !agent) return;
-        storedRun.status = "pending_confirmation";
-        storedRun.output = result.output;
-        storedRun.usage = result.usage;
-        storedRun.scan = combinedScan;
-        storedRun.pendingChanges = { files: changedFiles, truncated: changesTruncated };
-        storedRun.completedAt = completedAt;
-        database.messages.push({
-          id: randomUUID(),
-          agentId: agent.id,
-          runId: run.id,
-          role: "assistant",
-          content: result.output,
-          createdAt: completedAt,
-        });
-        agent.codexThreadId = result.threadId;
-        agent.lastError = null;
-        agent.updatedAt = completedAt;
+      await this.repository.updateRun(run.id, {
+        status: "pending_confirmation",
+        output: result.output,
+        usage: result.usage,
+        scan: combinedScan,
+        pendingChanges: { files: changedFiles, truncated: changesTruncated },
+        completedAt,
+      });
+      await this.repository.insertMessage({
+        id: randomUUID(),
+        agentId: agentAtStart.id,
+        runId: run.id,
+        role: "assistant",
+        content: result.output,
+        createdAt: completedAt,
+      });
+      await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
+        codexThreadId: result.threadId,
+        lastError: null,
+        updatedAt: completedAt,
+        // status stays "busy" — waiting on the user's decision.
       });
     } catch (error) {
       if (handle) {
@@ -486,39 +434,36 @@ export class AgentService {
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
       const message = error instanceof Error ? error.message : String(error);
-      await this.store.mutate((database) => {
-        const storedRun = database.runs.find((item) => item.id === run.id);
-        const agent = database.agents.find((item) => item.id === agentAtStart.id);
-        if (storedRun) {
-          storedRun.status = cancelled ? "cancelled" : "failed";
-          storedRun.error = message;
-          storedRun.completedAt = completedAt;
-        }
-        if (agent) {
-          if (agent.status !== "stopped") {
-            agent.status = cancelled ? "ready" : "error";
-          }
-          agent.lastError = cancelled ? null : message;
-          agent.updatedAt = completedAt;
-        }
+      await this.repository.updateRun(run.id, {
+        status: cancelled ? "cancelled" : "failed",
+        error: message,
+        completedAt,
       });
+      const latest = await this.repository.getAgent(agentAtStart.id, agentAtStart.ownerId);
+      if (latest && latest.status !== "stopped") {
+        await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
+          status: cancelled ? "ready" : "error",
+          lastError: cancelled ? null : message,
+          updatedAt: completedAt,
+        });
+      }
     }
   }
 
-  private async setStatus(id: string, status: Agent["status"]): Promise<Agent> {
-    return this.store.mutate((database) => {
-      const agent = database.agents.find((item) => item.id === id);
-      if (!agent) {
-        throw new HttpError(404, "Agent not found");
-      }
-      if (status === "ready" && agent.status === "busy") {
+  private async setStatus(id: string, ownerId: string, status: Agent["status"]): Promise<Agent> {
+    if (status === "ready") {
+      const current = await this.repository.getAgent(id, ownerId);
+      if (current?.status === "busy") {
         throw new HttpError(409, "Stop the active run before starting this Agent");
       }
-      agent.status = status;
-      if (status === "ready") agent.lastError = null;
-      agent.updatedAt = now();
-      return structuredClone(agent);
-    });
+    }
+    const patch: Partial<PersistedAgent> = { status, updatedAt: now() };
+    if (status === "ready") patch.lastError = null;
+    const updated = await this.repository.updateAgent(id, ownerId, patch);
+    if (!updated) {
+      throw new HttpError(404, "Agent not found");
+    }
+    return this.toPublicAgent(updated);
   }
 
   private async cancelExecution(agentId: string): Promise<void> {
@@ -534,28 +479,22 @@ export class AgentService {
     }
   }
 
-  private latestRun(agentId: string): AgentRun | undefined {
-    return this.store
-      .snapshot()
-      .runs.filter((run) => run.agentId === agentId)
-      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+  private async latestRun(agentId: string): Promise<AgentRun | undefined> {
+    const runs = await this.repository.listRuns(agentId);
+    return runs[0];
   }
 
   /** Used when stopping or deleting an Agent that has a proposal still
    * awaiting review — leaves no orphaned staging directory and no run
    * stuck forever in "pending_confirmation". */
-  private async discardPendingTransactionIfAny(agentId: string): Promise<void> {
-    if (!(await this.transactions.hasActive(agentId))) return;
-    const agent = this.getAgent(agentId);
-    const handle = await this.transactions.begin(agentId, agent.workspacePath);
+  private async discardPendingTransactionIfAny(agent: Agent): Promise<void> {
+    if (!(await this.transactions.hasActive(agent.id))) return;
+    const handle = await this.transactions.begin(agent.id, agent.workspacePath);
     await this.transactions.rollback(handle);
-    await this.store.mutate((database) => {
-      for (const run of database.runs) {
-        if (run.agentId === agentId && run.status === "pending_confirmation") {
-          run.status = "discarded";
-          run.completedAt = now();
-        }
-      }
-    });
+    const runs = await this.repository.listRuns(agent.id);
+    const pending = runs.find((run) => run.status === "pending_confirmation");
+    if (pending) {
+      await this.repository.updateRun(pending.id, { status: "discarded", completedAt: now() });
+    }
   }
 }

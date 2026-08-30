@@ -32,18 +32,15 @@ const envSchema = z.object({
     .max(48)
     .regex(/^[a-zA-Z0-9_.-]+$/)
     .default("default"),
-  APP_AUTH_TOKEN: z
-    .string()
-    .trim()
-    .max(128)
-    .regex(/^[A-Za-z0-9._~-]*$/, "APP_AUTH_TOKEN must use URL-safe characters")
-    .optional(),
   ARK_API_KEY: z.string().optional(),
   ARK_MODEL: z.string().optional(),
   ARK_BASE_URL: z
     .string()
     .url()
     .default("https://ark.cn-beijing.volces.com/api/v3"),
+  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_ANON_KEY: z.string().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 });
 
@@ -51,15 +48,6 @@ export type AppConfig = ReturnType<typeof loadConfig>;
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
   const env = envSchema.parse(environment);
-  const authToken = env.APP_AUTH_TOKEN?.trim() ?? "";
-  const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
-  if (env.NODE_ENV === "production" && !loopbackHosts.has(env.HOST)) {
-    if (authToken.length < 24 || authToken.startsWith("replace-")) {
-      throw new Error(
-        "APP_AUTH_TOKEN must contain at least 24 characters for a non-loopback production server",
-      );
-    }
-  }
   const defaultContainerUser =
     typeof process.getuid === "function" && typeof process.getgid === "function"
       ? process.getuid() + ":" + process.getgid()
@@ -83,10 +71,12 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     containerPidsLimit: env.CONTAINER_PIDS_LIMIT,
     containerUser: env.CONTAINER_USER?.trim() || defaultContainerUser,
     runtimeInstanceId: env.RUNTIME_INSTANCE_ID,
-    authToken,
     arkApiKey: env.ARK_API_KEY?.trim() ?? "",
     arkModel: env.ARK_MODEL?.trim() ?? "",
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
+    supabaseUrl: env.SUPABASE_URL?.trim() ?? "",
+    supabaseAnonKey: env.SUPABASE_ANON_KEY?.trim() ?? "",
+    supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? "",
     nodeEnv: env.NODE_ENV,
   };
 }
@@ -97,6 +87,26 @@ export function isArkConfigured(config: AppConfig): boolean {
     !config.arkApiKey.startsWith("replace-") &&
     config.arkModel.length > 0 &&
     !config.arkModel.includes("replace-")
+  );
+}
+
+export function isSupabaseConfigured(config: AppConfig): boolean {
+  return (
+    config.supabaseUrl.length > 0 &&
+    !config.supabaseUrl.includes("your-project-ref") &&
+    config.supabaseAnonKey.length > 0 &&
+    !config.supabaseAnonKey.startsWith("replace-")
+  );
+}
+
+/** Whether Agents/Messages/Runs should be persisted to Postgres instead of
+ * the local JSON file. Requires the service_role key in addition to the
+ * anon key auth alone needs. */
+export function isSupabaseDataStoreConfigured(config: AppConfig): boolean {
+  return (
+    isSupabaseConfigured(config) &&
+    config.supabaseServiceRoleKey.length > 0 &&
+    !config.supabaseServiceRoleKey.startsWith("replace-")
   );
 }
 

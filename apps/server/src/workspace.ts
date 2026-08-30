@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { scanPdfBuffer } from "./pdf-scanner.js";
 import type { Agent, ScanFinding } from "./types.js";
@@ -30,6 +30,16 @@ export class WorkspaceManager {
   async initialize(): Promise<void> {
     await mkdir(this.root, { recursive: true });
     await mkdir(path.join(this.root, ".deleted"), { recursive: true });
+  }
+
+  /** True if this machine already has a workspace folder for this Agent. */
+  async exists(agentId: string): Promise<boolean> {
+    try {
+      await access(this.workspacePath(agentId));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async create(agent: Agent): Promise<void> {
@@ -187,7 +197,12 @@ export class WorkspaceManager {
     return { files, truncated, extraFindings };
   }
 
-  async archive(agent: Agent): Promise<string> {
+  /** Archives the local workspace, or does nothing if this machine never
+   * materialized one for this Agent (e.g. it was only ever used elsewhere). */
+  async archive(agent: Agent): Promise<string | null> {
+    if (!(await this.exists(agent.id))) {
+      return null;
+    }
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const destination = path.join(
       this.root,
