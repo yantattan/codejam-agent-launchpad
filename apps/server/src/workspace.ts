@@ -1,11 +1,18 @@
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Agent } from "./types.js";
+import { scanPdfBuffer } from "./pdf-scanner.js";
+import type { Agent, ScanFinding } from "./types.js";
 
 export interface ScannableFile {
   /** Relative to the Agent's workspace root, forward-slash separated. */
   path: string;
   content: string;
+}
+
+const PDF_MAGIC = "%PDF-";
+
+function looksLikePdf(buffer: Buffer): boolean {
+  return buffer.subarray(0, PDF_MAGIC.length).toString("latin1") === PDF_MAGIC;
 }
 
 const SKIP_DIR_NAMES = new Set([".git", ".codex", "node_modules", "dist", ".deleted"]);
@@ -82,12 +89,13 @@ export class WorkspaceManager {
   async readScannableFiles(
     agent: Agent,
     opts: { maxFiles?: number; maxBytesPerFile?: number; maxTotalBytes?: number } = {},
-  ): Promise<{ files: ScannableFile[]; truncated: boolean }> {
+  ): Promise<{ files: ScannableFile[]; truncated: boolean; extraFindings: ScanFinding[] }> {
     const maxFiles = opts.maxFiles ?? DEFAULT_MAX_FILES;
     const maxBytesPerFile = opts.maxBytesPerFile ?? DEFAULT_MAX_BYTES_PER_FILE;
     const maxTotalBytes = opts.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
 
     const files: ScannableFile[] = [];
+    const extraFindings: ScanFinding[] = [];
     let totalBytes = 0;
     let truncated = false;
 
@@ -129,17 +137,54 @@ export class WorkspaceManager {
         } catch {
           continue;
         }
-        if (buffer.subarray(0, 512).includes(0)) continue; // binary sniff
+        const relativePath = path.relative(agent.workspacePath, fullPath).split(path.sep).join("/");
+
+        if (looksLikePdf(buffer)) {
+          // Parsed directly with the same library family a naive ingestion
+          // pipeline would use, rather than trusting the rendered page —
+          // see pdf-scanner.ts for why.
+          const extraction = await scanPdfBuffer(buffer, relativePath);
+          extraFindings.push(...extraction.visualFindings);
+          const combined = [
+            extraction.text,
+            Object.keys(extraction.metadata).length > 0
+              ? "[PDF metadata]\n" +
+                Object.entries(extraction.metadata)
+                  .map(([key, value]) => key + ": " + value)
+                  .join("\n")
+              : "",
+            extraction.annotationText.length > 0
+              ? "[PDF annotations]\n" + extraction.annotationText.join("\n")
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n\n");
+          totalBytes += buffer.byteLength;
+          files.push({ path: relativePath, content: combined });
+          continue;
+        }
+
+        if (buffer.subarray(0, 512).includes(0)) {
+          // Not text and not a PDF we know how to parse — flag rather than
+          // silently vanish, so an operator can see something was skipped.
+          extraFindings.push({
+            tier: "static",
+            severity: "suspicious",
+            technique: "unparsed-binary-format",
+            source: "workspace-file",
+            path: relativePath,
+            excerpt: "(binary content, " + buffer.byteLength + " bytes)",
+            detail: "This file's format isn't inspected by the scanner (not text, not a recognized PDF) — its contents were not checked.",
+          });
+          continue;
+        }
         totalBytes += buffer.byteLength;
-        files.push({
-          path: path.relative(agent.workspacePath, fullPath).split(path.sep).join("/"),
-          content: buffer.toString("utf8"),
-        });
+        files.push({ path: relativePath, content: buffer.toString("utf8") });
       }
     };
 
     await walk(agent.workspacePath);
-    return { files, truncated };
+    return { files, truncated, extraFindings };
   }
 
   async archive(agent: Agent): Promise<string> {

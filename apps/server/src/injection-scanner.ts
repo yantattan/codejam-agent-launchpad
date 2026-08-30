@@ -206,6 +206,201 @@ function detectInvisibleOrHomoglyphChars(text: string): ScanFinding[] {
   return findings;
 }
 
+// --- Self-declared conclusions: text trying to dictate the evaluator's
+// decision directly, rather than just describing qualifications ---
+
+const SELF_DECLARATION_PATTERNS: RegExp[] = [
+  /\b(select|choose|hire|pick|approve|advance)\s+(me|this\s+candidate|this\s+application|this\s+resume)\b/i,
+  /\bi\s+am\s+(clearly|definitely|obviously|undoubtedly)?\s*(the\s+)?(best|ideal|perfect|top|number\s*one|#\s*1)\s+(candidate|fit|choice|applicant)\b/i,
+  /\brank\s+(me|this\s+candidate|this\s+resume)\s+(first|#?\s*1|highest)\b/i,
+  /\bno\s+other\s+candidate\s+(compares|is\s+as\s+qualified|comes\s+close)\b/i,
+  /\bmove\s+(me|this\s+candidate)\s+(forward|to\s+the\s+next\s+(stage|round))\b/i,
+];
+
+function detectSelfDeclaredConclusion(text: string): ScanFinding[] {
+  const findings: ScanFinding[] = [];
+  for (const regex of SELF_DECLARATION_PATTERNS) {
+    const match = regex.exec(text);
+    if (match) {
+      findings.push(
+        finding({
+          severity: "malicious",
+          technique: "self-declared-conclusion",
+          source: "prompt",
+          excerpt: excerptAround(text, match.index, match[0].length),
+          detail:
+            "Document tries to directly dictate the evaluator's decision (who to select/rank/approve) rather than describing qualifications for a human or Agent to judge.",
+        }),
+      );
+    }
+  }
+  return findings;
+}
+
+// --- Exaggerated / superlative-heavy language: a density heuristic, not a
+// single-keyword match, since normal enthusiastic writing uses these words
+// occasionally too ---
+
+const SUPERLATIVE_WORDS = [
+  "best",
+  "unparalleled",
+  "unmatched",
+  "unrivaled",
+  "world-class",
+  "world class",
+  "perfect",
+  "flawless",
+  "exceptional",
+  "phenomenal",
+  "extraordinary",
+  "unbeatable",
+  "greatest",
+  "number one",
+  "incomparable",
+  "peerless",
+  "unstoppable",
+  "the ideal candidate",
+];
+
+function detectExaggeratedClaims(text: string): ScanFinding[] {
+  const lower = text.toLowerCase();
+  const wordCount = Math.max(1, text.trim().split(/\s+/).length);
+  let hits = 0;
+  const matched: string[] = [];
+  for (const phrase of SUPERLATIVE_WORDS) {
+    const count = lower.split(phrase).length - 1;
+    if (count > 0) {
+      hits += count;
+      matched.push(phrase);
+    }
+  }
+  // An absolute-count gate (>=3 distinct superlatives) matters regardless
+  // of document length; a density gate only makes sense once there's
+  // enough text for the ratio to mean anything — otherwise one incidental
+  // "best" in a short sentence would trip it.
+  const dense = wordCount >= 50 && hits / wordCount > 0.02;
+  if (hits < 3 && !dense) return [];
+  return [
+    finding({
+      severity: "suspicious",
+      technique: "exaggerated-language",
+      source: "prompt",
+      excerpt: matched.slice(0, 6).join(", "),
+      detail:
+        "Unusually dense superlative/absolute language (" +
+        hits +
+        " instances: " +
+        matched.slice(0, 6).join(", ") +
+        ") — a pattern used to game automated scoring rather than describe genuine qualifications. Density alone isn't proof; treat as a lower-confidence signal.",
+    }),
+  ];
+}
+
+// --- Hidden-via-styling: text that's structurally present and readable by
+// an Agent parsing raw content, but invisible to a human looking at it
+// rendered — color matching the background, zero font size, off-screen
+// positioning, etc. This is a distinct mechanism from the zero-width
+// Unicode tricks above: the characters themselves are perfectly normal,
+// only the *styling* hides them. ---
+
+function extractStyleBlocks(text: string): string[] {
+  const blocks: string[] = [];
+  for (const match of text.matchAll(/style\s*=\s*["']([^"']*)["']/gi)) {
+    if (match[1]) blocks.push(match[1]);
+  }
+  for (const styleTag of text.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)) {
+    const body = styleTag[1] ?? "";
+    for (const rule of body.matchAll(/\{([^}]*)\}/g)) {
+      if (rule[1]) blocks.push(rule[1]);
+    }
+  }
+  return blocks;
+}
+
+function parseDeclarations(block: string): Record<string, string> {
+  const props: Record<string, string> = {};
+  for (const decl of block.split(";")) {
+    const colonIndex = decl.indexOf(":");
+    if (colonIndex === -1) continue;
+    const prop = decl.slice(0, colonIndex).trim().toLowerCase();
+    const value = decl.slice(colonIndex + 1).trim().toLowerCase();
+    if (prop) props[prop] = value;
+  }
+  return props;
+}
+
+const NAMED_COLOR_HEX: Record<string, string> = {
+  white: "#ffffff",
+  black: "#000000",
+  snow: "#fffafa",
+  ivory: "#fffff0",
+};
+
+function normalizeColor(value: string): string {
+  const v = value.trim().toLowerCase().replace(/\s+/g, "");
+  if (NAMED_COLOR_HEX[v]) return NAMED_COLOR_HEX[v];
+  const hexShort = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/.exec(v);
+  if (hexShort && hexShort[1] && hexShort[2] && hexShort[3]) {
+    return "#" + hexShort[1] + hexShort[1] + hexShort[2] + hexShort[2] + hexShort[3] + hexShort[3];
+  }
+  return v;
+}
+
+const OFFSCREEN_OFFSET = /-(\d{3,})(px|em|rem|%)/;
+const ZERO_ISH_FONT_SIZE = /^0(\.0*)?(px|pt|em|rem|%)?$/;
+
+function detectHiddenViaStyling(text: string): ScanFinding[] {
+  const findings: ScanFinding[] = [];
+  for (const block of extractStyleBlocks(text)) {
+    const props = parseDeclarations(block);
+    const index = text.indexOf(block);
+    const excerpt = excerptAround(text, index === -1 ? 0 : index, block.length);
+    const push = (severity: ScanSeverity, technique: string, detail: string) =>
+      findings.push(finding({ severity, technique, source: "prompt", excerpt, detail }));
+
+    const color = props["color"];
+    const background = props["background-color"] ?? props["background"];
+    if (color && background) {
+      const normalizedColor = normalizeColor(color);
+      const normalizedBackground = normalizeColor(background);
+      if (normalizedColor === normalizedBackground && normalizedColor !== "transparent") {
+        push(
+          "malicious",
+          "hidden-text-color-match",
+          "Text color is set identical to its background color (" +
+            normalizedColor +
+            ") — invisible to a human reader, but the content is still read and acted on by the Agent.",
+        );
+      }
+    }
+
+    const fontSize = props["font-size"];
+    if (fontSize && ZERO_ISH_FONT_SIZE.test(fontSize.replace(/\s+/g, ""))) {
+      push("malicious", "hidden-text-zero-font-size", "Text is styled at zero or near-zero font size — never renders visibly.");
+    }
+
+    const opacity = props["opacity"] !== undefined ? Number.parseFloat(props["opacity"]) : null;
+    if (opacity !== null && !Number.isNaN(opacity) && opacity <= 0.05) {
+      push("malicious", "hidden-text-near-zero-opacity", "Text opacity is set to " + opacity + " — effectively invisible.");
+    }
+
+    if (props["display"] === "none") {
+      push("suspicious", "hidden-text-display-none", "Content is styled display:none — not rendered to a human reader. Has legitimate uses (templates, toggles), so flagged rather than blocked on its own.");
+    }
+    if (props["visibility"] === "hidden") {
+      push("suspicious", "hidden-text-visibility-hidden", "Content is styled visibility:hidden — not rendered to a human reader.");
+    }
+
+    const offsets = ["left", "top", "margin-left", "margin-top", "text-indent"]
+      .map((key) => props[key])
+      .filter((value): value is string => Boolean(value));
+    if (props["position"] === "absolute" && offsets.some((value) => OFFSCREEN_OFFSET.test(value))) {
+      push("malicious", "hidden-text-offscreen-position", "Content is absolutely positioned far outside the visible page area — never seen by a human reader.");
+    }
+  }
+  return findings;
+}
+
 // --- Technique 6: encoded content ---
 
 const BASE64_TOKEN = /[A-Za-z0-9+/]{12,}={0,2}/g;
@@ -295,6 +490,9 @@ function runStaticChecks(target: ScanTarget): ScanFinding[] {
     ...detectFakeSystemMessage(target.text),
     ...detectInvisibleOrHomoglyphChars(target.text),
     ...detectEncodedContent(target.text, target.source),
+    ...detectSelfDeclaredConclusion(target.text),
+    ...detectExaggeratedClaims(target.text),
+    ...detectHiddenViaStyling(target.text),
   ];
   return raw.map((item) => ({
     ...item,
@@ -339,4 +537,13 @@ export class InjectionScanner {
   }
 }
 
-export { buildAgentContext, detectEncodedContent, detectFakeSystemMessage, detectInstructionPatterns, detectInvisibleOrHomoglyphChars };
+export {
+  buildAgentContext,
+  detectEncodedContent,
+  detectExaggeratedClaims,
+  detectFakeSystemMessage,
+  detectHiddenViaStyling,
+  detectInstructionPatterns,
+  detectInvisibleOrHomoglyphChars,
+  detectSelfDeclaredConclusion,
+};

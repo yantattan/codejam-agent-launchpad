@@ -283,16 +283,19 @@ export class AgentService {
       // this is what Codex is about to read this turn, and catches content
       // that arrived after the Agent was created (a file added between
       // turns, or by a prior turn's own output).
-      const { files, truncated: filesTruncated } = await this.workspaces.readScannableFiles(
-        agentAtStart,
-      );
+      const {
+        files,
+        truncated: filesTruncated,
+        extraFindings,
+      } = await this.workspaces.readScannableFiles(agentAtStart);
       const fileScan = await this.scanner.scan(
         agentAtStart,
         files.map((file) => ({ source: "workspace-file" as const, path: file.path, text: file.content })),
       );
+      const allFindings = [...promptScan.findings, ...fileScan.findings, ...extraFindings];
       const combinedScan: ScanVerdict = {
-        blocked: promptScan.blocked || fileScan.blocked,
-        findings: [...promptScan.findings, ...fileScan.findings],
+        blocked: allFindings.some((item) => item.severity === "malicious"),
+        findings: allFindings,
         scannedAt: now(),
         ...((promptScan.truncated ?? false) || (fileScan.truncated ?? false) || filesTruncated
           ? { truncated: true }
