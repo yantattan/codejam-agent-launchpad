@@ -186,6 +186,15 @@ button {
   background: #f1d9d6;
 }
 
+.button-delete {
+  background: var(--red);
+  color: white;
+}
+
+.button-delete:hover:not(:disabled) {
+  background: #ab3f3f;
+}
+
 .create-button {
   width: 100%;
   justify-content: flex-start;
@@ -791,6 +800,13 @@ textarea:focus {
   border-left: 2px solid #8a76e7;
 }
 
+.message-pending-note {
+  margin: 4px 0 0 14px;
+  font-size: 10px;
+  font-style: italic;
+  color: #8a6a17;
+}
+
 .thinking {
   opacity: 0.82;
 }
@@ -927,6 +943,47 @@ textarea:focus {
   border-radius: 8px;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.5);
+}
+
+.file-change-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.file-change-group + .file-change-group {
+  margin-top: 8px;
+}
+
+.file-change-group .file-change-list {
+  margin-top: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.file-change-group-bar {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 5px 9px;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}
+
+.file-change-group-created {
+  background: #dcf1e7;
+  color: var(--green);
+}
+
+.file-change-group-modified {
+  background: #fff2c6;
+  color: #8a6a17;
+}
+
+.file-change-group-deleted {
+  background: #f6dfdc;
+  color: var(--red);
 }
 
 .file-change-row {

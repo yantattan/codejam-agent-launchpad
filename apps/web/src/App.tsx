@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, ApiError, setAuthToken } from "./api";
+import { api, ApiError, setAuthToken, setUnauthorizedHandler } from "./api";
 import type { Agent, AgentRun, FileChange, Message, ScanFinding, ScanVerdict, SystemInfo } from "./types";
 
 const starterPrompts = [
@@ -147,6 +147,21 @@ function FileChangeRow({
   );
 }
 
+const fileChangeGroupOrder: FileChange["kind"][] = ["created", "modified", "deleted"];
+const fileChangeGroupLabel: Record<FileChange["kind"], string> = {
+  created: "Created",
+  modified: "Modified",
+  deleted: "Deleted",
+};
+
+function FileChangeGroupBar({ kind, count }: { kind: FileChange["kind"]; count: number }) {
+  return (
+    <div className={"file-change-group-bar file-change-group-" + kind}>
+      {fileChangeGroupLabel[kind]} · {count} file{count === 1 ? "" : "s"}
+    </div>
+  );
+}
+
 function PendingChangesPanel({
   run,
   busy,
@@ -160,6 +175,10 @@ function PendingChangesPanel({
 }) {
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
   const files = run.pendingChanges?.files ?? [];
+  const kindsPresent = fileChangeGroupOrder.filter((kind) =>
+    files.some((file) => file.kind === kind),
+  );
+  const groupByKind = kindsPresent.length > 1;
 
   const toggle = (path: string) => {
     setExpandedPaths((current) => {
@@ -179,16 +198,37 @@ function PendingChangesPanel({
         Codex proposes {files.length} file change{files.length === 1 ? "" : "s"} — review before
         applying
       </strong>
-      <ul className="file-change-list">
-        {files.map((file) => (
-          <FileChangeRow
-            key={file.path}
-            file={file}
-            expanded={expandedPaths.has(file.path)}
-            onToggle={() => toggle(file.path)}
-          />
-        ))}
-      </ul>
+      {groupByKind ? (
+        kindsPresent.map((kind) => {
+          const groupFiles = files.filter((file) => file.kind === kind);
+          return (
+            <div className="file-change-group" key={kind}>
+              <FileChangeGroupBar kind={kind} count={groupFiles.length} />
+              <ul className="file-change-list">
+                {groupFiles.map((file) => (
+                  <FileChangeRow
+                    key={file.path}
+                    file={file}
+                    expanded={expandedPaths.has(file.path)}
+                    onToggle={() => toggle(file.path)}
+                  />
+                ))}
+              </ul>
+            </div>
+          );
+        })
+      ) : (
+        <ul className="file-change-list">
+          {files.map((file) => (
+            <FileChangeRow
+              key={file.path}
+              file={file}
+              expanded={expandedPaths.has(file.path)}
+              onToggle={() => toggle(file.path)}
+            />
+          ))}
+        </ul>
+      )}
       {run.pendingChanges?.truncated && (
         <p className="file-change-truncated-note">
           Some files were too large to fully diff and were reported without detail.
@@ -217,6 +257,7 @@ export default function App() {
   const [prompt, setPrompt] = useState("");
   const [activeRun, setActiveRun] = useState<AgentRun | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState<boolean | null>(null);
   const [authInput, setAuthInput] = useState("");
@@ -253,6 +294,16 @@ export default function App() {
   }, [refreshAgents]);
 
   useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setAuthToken("");
+      setAuthRequired(true);
+      setAuthInput("");
+      setActiveRun(null);
+      setError("Your session expired — please sign in again.");
+    });
+  }, []);
+
+  useEffect(() => {
     mountedRef.current = true;
     void api
       .auth()
@@ -270,6 +321,7 @@ export default function App() {
   useEffect(() => {
     setActiveRun(null);
     setShowSettings(false);
+    setSending(false);
     if (!selectedId) {
       setMessages([]);
       return;
@@ -393,25 +445,29 @@ export default function App() {
 
   const sendMessage = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!selected || !prompt.trim()) return;
+    if (!selected || !prompt.trim() || sending) return;
+    const agentId = selected.id;
     const content = prompt.trim();
     setPrompt("");
     setError(null);
+    setSending(true);
     try {
-      const result = await api.sendMessage(selected.id, content);
-      if (selectedIdRef.current === selected.id) {
+      const result = await api.sendMessage(agentId, content);
+      if (selectedIdRef.current === agentId) {
         setMessages((current) => [...current, result.message]);
         setActiveRun(result.run);
       }
       setAgents((current) =>
         current.map((agent) =>
-          agent.id === selected.id ? { ...agent, status: "busy" } : agent,
+          agent.id === agentId ? { ...agent, status: "busy" } : agent,
         ),
       );
-      await pollRun(result.run.id, selected.id);
+      setSending(false);
+      await pollRun(result.run.id, agentId);
     } catch (reason) {
+      setSending(false);
       setError(reason instanceof Error ? reason.message : String(reason));
-      setActiveRun(null);
+      if (selectedIdRef.current === agentId) setActiveRun(null);
       await refreshAgents();
     }
   };
@@ -617,7 +673,7 @@ export default function App() {
                   {selected.status === "stopped" ? "Start" : "Stop"}
                 </button>
                 <button
-                  className="button button-danger"
+                  className="button button-delete"
                   onClick={deleteAgent}
                   disabled={busy || selected.status === "busy"}
                 >
@@ -689,7 +745,7 @@ export default function App() {
               </div>
 
               <div className="messages">
-                {messages.length === 0 && !activeRun ? (
+                {messages.length === 0 && !activeRun && !sending ? (
                   <div className="welcome">
                     <div className="welcome-orbit">
                       <div>⌁</div>
@@ -716,10 +772,30 @@ export default function App() {
                         <span>{formatTime(message.createdAt)}</span>
                       </div>
                       <div className="message-body">{message.content}</div>
+                      {message.role === "assistant" &&
+                        activeRun?.status === "pending_confirmation" &&
+                        message.runId === activeRun.id && (
+                          <p className="message-pending-note">
+                            Proposed only — nothing has been applied yet. Review the changes
+                            below before they take effect.
+                          </p>
+                        )}
                     </article>
                   ))
                 )}
-                {activeRun && ["queued", "running"].includes(activeRun.status) && (
+                {sending && (
+                  <article className="message message-assistant thinking">
+                    <div className="message-meta">
+                      <strong>{selected.name}</strong>
+                      <span>sending…</span>
+                    </div>
+                    <div className="thinking-row">
+                      <Spinner />
+                      Scanning the prompt and starting the run…
+                    </div>
+                  </article>
+                )}
+                {!sending && activeRun && ["queued", "running"].includes(activeRun.status) && (
                   <article className="message message-assistant thinking">
                     <div className="message-meta">
                       <strong>{selected.name}</strong>
@@ -731,23 +807,23 @@ export default function App() {
                     </div>
                   </article>
                 )}
-                {activeRun?.status === "failed" && (
+                {!sending && activeRun?.status === "failed" && (
                   <article className="run-error">
                     <strong>Run failed</strong>
                     <span>{activeRun.error}</span>
                   </article>
                 )}
-                {activeRun?.status === "blocked" && (
+                {!sending && activeRun?.status === "blocked" && (
                   <article className="run-error scan-blocked">
                     <strong>Blocked — potential prompt injection detected</strong>
                     <span>Codex never started. The instruction never reached the model.</span>
                     <ScanFindingsList findings={activeRun.scan?.findings ?? []} />
                   </article>
                 )}
-                {activeRun?.status === "completed" && activeRun.scan && (
+                {!sending && activeRun?.status === "completed" && activeRun.scan && (
                   <ScanSummary scan={activeRun.scan} />
                 )}
-                {activeRun?.status === "pending_confirmation" && (
+                {!sending && activeRun?.status === "pending_confirmation" && (
                   <PendingChangesPanel
                     run={activeRun}
                     busy={busy}
@@ -755,7 +831,7 @@ export default function App() {
                     onDiscard={() => void discardPendingRun(activeRun.id)}
                   />
                 )}
-                {activeRun?.status === "discarded" && (
+                {!sending && activeRun?.status === "discarded" && (
                   <article className="run-error scan-discarded">
                     <strong>Proposal discarded</strong>
                     <span>You reviewed the proposed changes and discarded them — nothing was changed.</span>
@@ -777,11 +853,14 @@ export default function App() {
                   placeholder={
                     selected.status === "stopped"
                       ? "Start this Agent to continue…"
-                      : activeRun?.status === "pending_confirmation"
-                        ? "Ask Codex to adjust the proposed changes…"
-                        : "Describe what you want the Agent to do…"
+                      : sending
+                        ? "Sending…"
+                        : activeRun?.status === "pending_confirmation"
+                          ? "Ask Codex to adjust the proposed changes…"
+                          : "Describe what you want the Agent to do…"
                   }
                   disabled={
+                    sending ||
                     selected.status === "stopped" ||
                     (selected.status === "busy" && activeRun?.status !== "pending_confirmation") ||
                     (activeRun != null && ["queued", "running"].includes(activeRun.status))
@@ -795,6 +874,7 @@ export default function App() {
                   <button
                     className="send-button"
                     disabled={
+                      sending ||
                       !prompt.trim() ||
                       selected.status === "stopped" ||
                       (selected.status === "busy" && activeRun?.status !== "pending_confirmation") ||
@@ -802,7 +882,7 @@ export default function App() {
                     }
                     aria-label="Send message"
                   >
-                    ↑
+                    {sending ? <Spinner /> : "↑"}
                   </button>
                 </div>
               </form>

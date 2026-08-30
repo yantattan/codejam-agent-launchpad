@@ -4,7 +4,7 @@
     {
       "name": "web-dev",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": ["run", "dev", "-w", "@launchpad/web"],
       "port": 5173
     }
   ]

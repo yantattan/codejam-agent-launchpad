@@ -85,30 +85,50 @@ function detectInstructionPatterns(text: string): ScanFinding[] {
   return findings;
 }
 
+function looksLikeHeaderLine(line: string): boolean {
+  return (
+    FAKE_HEADER_KEYWORDS.test(line.toUpperCase()) ||
+    (/^[A-Z][A-Z0-9 _-]{3,}$/.test(line) && line === line.toUpperCase())
+  );
+}
+
 function detectFakeSystemMessage(text: string): ScanFinding[] {
   const findings: ScanFinding[] = [];
   const lines = text.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i++) {
+  let i = 0;
+  while (i < lines.length) {
     const line = lines[i]?.trim() ?? "";
-    if (!line) continue;
-    const looksLikeHeader =
-      FAKE_HEADER_KEYWORDS.test(line.toUpperCase()) ||
-      (/^[A-Z][A-Z0-9 _-]{3,}$/.test(line) && line === line.toUpperCase());
-    if (!looksLikeHeader) continue;
-    const windowText = lines.slice(i, i + 5).join(" ");
+    if (!line || !looksLikeHeaderLine(line)) {
+      i++;
+      continue;
+    }
+
+    // A fake system-message block is usually several header-like lines in
+    // a row ("SYSTEM CONFIGURATION" / "Priority: Critical" / ...) — consume
+    // the whole run as one block instead of flagging each line on its own.
+    let end = i + 1;
+    while (end < lines.length) {
+      const candidate = lines[end]?.trim() ?? "";
+      if (!candidate || !looksLikeHeaderLine(candidate)) break;
+      end++;
+    }
+
+    const blockLines = lines.slice(i, end);
+    const windowText = lines.slice(i, end + 5).join(" ");
     const hasImperative = IMPERATIVE_NEARBY.test(windowText);
-    const index = text.indexOf(line);
+    const index = text.indexOf(blockLines[0] ?? "");
     findings.push(
       finding({
         severity: hasImperative ? "malicious" : "suspicious",
         technique: "fake-system-message",
         source: "prompt",
-        excerpt: excerptAround(text, index === -1 ? 0 : index, windowText.length),
+        excerpt: excerptAround(text, index === -1 ? 0 : index, blockLines.join(" ").length),
         detail: hasImperative
           ? "Content mimics a system/developer message and pairs it with an imperative directive — this text has no real authority over the Agent."
           : "Content mimics a system/developer-style header. Treated as data, not as authoritative.",
       }),
     );
+    i = end;
   }
   return findings;
 }
@@ -349,14 +369,63 @@ function normalizeColor(value: string): string {
 const OFFSCREEN_OFFSET = /-(\d{3,})(px|em|rem|%)/;
 const ZERO_ISH_FONT_SIZE = /^0(\.0*)?(px|pt|em|rem|%)?$/;
 
-function detectHiddenViaStyling(text: string): ScanFinding[] {
+// A single hidden sentence is often marked up as many small elements (one
+// per word, sometimes one per letter — either a document-generator quirk
+// or a deliberate attempt to dodge whole-phrase matching). Each element
+// still triggers its own style-hiding condition, so hits are collected
+// with position first and coalesced afterward — adjacent same-technique
+// hits become one finding instead of one per element.
+interface StyleHit {
+  index: number;
+  end: number;
+  severity: ScanSeverity;
+  technique: string;
+  detail: string;
+}
+
+const STYLE_HIT_MERGE_GAP = 300;
+
+function coalesceStyleHits(text: string, hits: StyleHit[]): ScanFinding[] {
+  const sorted = [...hits].sort((left, right) => left.index - right.index);
   const findings: ScanFinding[] = [];
+  let i = 0;
+  while (i < sorted.length) {
+    const first = sorted[i];
+    if (!first) break;
+    let end = first.end;
+    let j = i + 1;
+    while (true) {
+      const next = sorted[j];
+      if (!next || next.technique !== first.technique || next.index - end > STYLE_HIT_MERGE_GAP) break;
+      end = Math.max(end, next.end);
+      j++;
+    }
+    const mergedCount = j - i;
+    findings.push(
+      finding({
+        severity: first.severity,
+        technique: first.technique,
+        source: "prompt",
+        excerpt: excerptAround(text, first.index, end - first.index),
+        detail: mergedCount > 1 ? first.detail + " (" + mergedCount + " adjacent occurrences merged)" : first.detail,
+      }),
+    );
+    i = j;
+  }
+  return findings;
+}
+
+function detectHiddenViaStyling(text: string): ScanFinding[] {
+  const hits: StyleHit[] = [];
+  let searchFrom = 0;
   for (const block of extractStyleBlocks(text)) {
+    const foundAt = text.indexOf(block, searchFrom);
+    const index = foundAt === -1 ? text.indexOf(block) : foundAt;
+    const resolvedIndex = index === -1 ? 0 : index;
+    if (index !== -1) searchFrom = index + block.length;
     const props = parseDeclarations(block);
-    const index = text.indexOf(block);
-    const excerpt = excerptAround(text, index === -1 ? 0 : index, block.length);
     const push = (severity: ScanSeverity, technique: string, detail: string) =>
-      findings.push(finding({ severity, technique, source: "prompt", excerpt, detail }));
+      hits.push({ index: resolvedIndex, end: resolvedIndex + block.length, severity, technique, detail });
 
     const color = props["color"];
     const background = props["background-color"] ?? props["background"];
@@ -398,7 +467,7 @@ function detectHiddenViaStyling(text: string): ScanFinding[] {
       push("malicious", "hidden-text-offscreen-position", "Content is absolutely positioned far outside the visible page area — never seen by a human reader.");
     }
   }
-  return findings;
+  return coalesceStyleHits(text, hits);
 }
 
 // --- Technique 6: encoded content ---
@@ -411,6 +480,10 @@ const BASE64_TOKEN = /[A-Za-z0-9+/]{12,}={0,2}/g;
 const PERCENT_TOKEN = /[%0-9A-Za-z._~-]{12,}/g;
 const PERCENT_PAIR = /%[0-9A-Fa-f]{2}/g;
 const MIN_PERCENT_PAIRS = 3;
+// A document with many separate encoded tokens (e.g. several embedded
+// assets) could otherwise produce one finding per token — cap it and
+// summarize the rest instead of flooding the results.
+const MAX_ENCODED_FINDINGS = 8;
 
 function printableRatio(text: string): number {
   if (text.length === 0) return 0;
@@ -477,6 +550,22 @@ function detectEncodedContent(text: string, source: ScanTargetSource, depth = 0)
       findings.push(...nested);
     }
     findings.push(...detectEncodedContent(decoded, source, depth + 1));
+  }
+
+  if (findings.length > MAX_ENCODED_FINDINGS) {
+    const shown = findings.slice(0, MAX_ENCODED_FINDINGS);
+    shown.push(
+      finding({
+        severity: "info",
+        technique: "encoded-content-truncated",
+        source,
+        excerpt: "",
+        detail:
+          (findings.length - MAX_ENCODED_FINDINGS) +
+          " additional encoded-content finding(s) omitted to avoid flooding the results.",
+      }),
+    );
+    return shown;
   }
 
   return findings;

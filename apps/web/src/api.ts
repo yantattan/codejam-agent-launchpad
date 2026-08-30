@@ -15,6 +15,16 @@ export function setAuthToken(token: string): void {
   authToken = token.trim();
 }
 
+let onUnauthorized: () => void = () => {};
+
+/** Called whenever any request comes back 401 (except /api/auth itself,
+ * which never requires a token) — lets the app react to an expired or
+ * invalid token by sending the user back to the login screen instead of
+ * just showing an error banner over a broken main view. */
+export function setUnauthorizedHandler(handler: () => void): void {
+  onUnauthorized = handler;
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const headers = {
     ...(options?.body ? { "Content-Type": "application/json" } : {}),
@@ -27,6 +37,9 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   });
   const data = (await response.json().catch(() => ({}))) as T & { error?: string };
   if (!response.ok) {
+    if (response.status === 401 && url !== "/api/auth") {
+      onUnauthorized();
+    }
     throw new ApiError(data.error ?? "Request failed", response.status);
   }
   return data;

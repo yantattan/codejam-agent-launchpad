@@ -62,6 +62,40 @@ function pdfFinding(
   };
 }
 
+// A hidden sentence is frequently drawn as many small showText runs (one
+// per word, sometimes one per glyph, depending on how the PDF was
+// generated). Each run still trips the same hiding condition on its own,
+// so hits are collected in drawing order first and coalesced afterward —
+// consecutive same-technique, same-page hits become one finding with the
+// combined text instead of one finding per run.
+interface VisualHit {
+  technique: string;
+  text: string;
+  pageNumber: number;
+  detail: string;
+}
+
+function coalesceVisualHits(hits: VisualHit[], sourcePath: string | undefined): ScanFinding[] {
+  const findings: ScanFinding[] = [];
+  let i = 0;
+  while (i < hits.length) {
+    const first = hits[i];
+    if (!first) break;
+    const texts = [first.text];
+    let j = i + 1;
+    while (true) {
+      const next = hits[j];
+      if (!next || next.technique !== first.technique || next.pageNumber !== first.pageNumber) break;
+      texts.push(next.text);
+      j++;
+    }
+    const label = "\"" + texts.join(" ") + "\" (page " + first.pageNumber + ")";
+    findings.push(pdfFinding("malicious", first.technique, sourcePath, label, first.detail));
+    i = j;
+  }
+  return findings;
+}
+
 /**
  * Walks a PDF page's raw operator list — the actual drawing instructions,
  * not the pre-composed text layer a naive text extractor exposes — to
@@ -75,7 +109,7 @@ async function extractVisualFindings(
   pdfDocument: Awaited<ReturnType<typeof import("pdfjs-dist/legacy/build/pdf.mjs").getDocument>["promise"]>,
   sourcePath: string | undefined,
 ): Promise<ScanFinding[]> {
-  const findings: ScanFinding[] = [];
+  const hits: VisualHit[] = [];
   const OPS = pdfjs.OPS;
 
   for (let pageNumber = 1; pageNumber <= pdfDocument.numPages; pageNumber++) {
@@ -115,50 +149,40 @@ async function extractVisualFindings(
         if (!text) continue;
 
         const [posX, posY] = [matrix[4] ?? 0, matrix[5] ?? 0];
-        const label = "\"" + text + "\" (page " + pageNumber + ")";
 
         if (fontSize > 0 && fontSize < NEAR_ZERO_FONT_SIZE_PT) {
-          findings.push(
-            pdfFinding(
-              "malicious",
-              "pdf-hidden-zero-font-size",
-              sourcePath,
-              label,
-              "Text is rendered at " +
-                fontSize.toFixed(2) +
-                "pt — invisible at any normal zoom level, but present in the extracted text a document-ingestion pipeline would receive.",
-            ),
-          );
+          hits.push({
+            technique: "pdf-hidden-zero-font-size",
+            text,
+            pageNumber,
+            detail:
+              "Text is rendered at a near-zero font size — invisible at any normal zoom level, but present in the extracted text a document-ingestion pipeline would receive.",
+          });
         }
         if (isNearWhite(fill)) {
-          findings.push(
-            pdfFinding(
-              "malicious",
-              "pdf-hidden-color-match",
-              sourcePath,
-              label,
-              "Text fill color is near-white — invisible against a normal white page, but present in the extracted text.",
-            ),
-          );
+          hits.push({
+            technique: "pdf-hidden-color-match",
+            text,
+            pageNumber,
+            detail: "Text fill color is near-white — invisible against a normal white page, but present in the extracted text.",
+          });
         }
         if (posX < x0 - OFFPAGE_MARGIN_PT || posX > x1 + OFFPAGE_MARGIN_PT || posY < y0 - OFFPAGE_MARGIN_PT || posY > y1 + OFFPAGE_MARGIN_PT) {
-          findings.push(
-            pdfFinding(
-              "malicious",
-              "pdf-hidden-offscreen-position",
-              sourcePath,
-              label,
+          hits.push({
+            technique: "pdf-hidden-offscreen-position",
+            text,
+            pageNumber,
+            detail:
               "Text is positioned outside the visible page area (page bounds " +
-                [x0, y0, x1, y1].map((v) => Math.round(v)).join(",") +
-                ") — never rendered where a human would look.",
-            ),
-          );
+              [x0, y0, x1, y1].map((v) => Math.round(v)).join(",") +
+              ") — never rendered where a human would look.",
+          });
         }
       }
     }
     page.cleanup();
   }
-  return findings;
+  return coalesceVisualHits(hits, sourcePath);
 }
 
 /**
