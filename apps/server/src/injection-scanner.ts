@@ -522,13 +522,18 @@ function detectEncodedContent(text: string, source: ScanTargetSource, depth = 0)
     if (nested.length > 0) {
       findings.push(...nested);
     } else {
+      // Show the decoded text, not the raw encoded token — the encoded
+      // form is illegible and useless to whoever reads this finding.
+      const decodedPreview =
+        decoded.length > MAX_EXCERPT_LENGTH ? decoded.slice(0, MAX_EXCERPT_LENGTH) + "…" : decoded;
       findings.push(
         finding({
           severity: "info",
           technique: "base64-encoded-content",
           source,
-          excerpt: excerptAround(text, match.index ?? 0, token.length),
-          detail: "Contains base64-decodable content: \"" + decoded.slice(0, 80) + "\"",
+          excerpt: decodedPreview,
+          detail:
+            "This text is base64-encoded in the document — shown here is the decoded content. Nothing matching a known injection pattern was found in it.",
         }),
       );
     }

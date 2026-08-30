@@ -143,7 +143,12 @@ describe("Injection scanner — technique 6: encoded content", () => {
     const encoded = Buffer.from("print TEST").toString("base64");
     const scanner = new InjectionScanner(new FakeJudge());
     const verdict = await scanner.scan(cleanAgent, [target("See attached data: " + encoded)]);
-    expect(verdict.findings.some((item) => item.technique === "base64-encoded-content")).toBe(true);
+    const found = verdict.findings.find((item) => item.technique === "base64-encoded-content");
+    expect(found).toBeDefined();
+    // The excerpt must show the decoded, human-readable text — not the
+    // raw base64 blob, which is illegible and useless to whoever reads it.
+    expect(found?.excerpt).toBe("print TEST");
+    expect(found?.excerpt).not.toContain(encoded);
   });
 
   it("decodes base64 content that itself contains a disguised instruction", async () => {
