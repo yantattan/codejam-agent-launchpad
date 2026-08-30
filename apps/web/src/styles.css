@@ -989,6 +989,13 @@ textarea:focus {
   color: var(--green);
 }
 
+.scan-summary-undo {
+  min-height: 22px;
+  padding: 0 10px;
+  font-size: 10px;
+  margin-left: 4px;
+}
+
 .scan-warning {
   display: flex;
   flex-direction: column;

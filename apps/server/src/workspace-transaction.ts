@@ -165,8 +165,12 @@ export interface WorkspaceTransactionManager {
    * refining the same pending proposal instead of starting over. */
   begin(agentId: string, persistentPath: string): Promise<TransactionHandle>;
   diffChanges(handle: TransactionHandle): Promise<{ files: FileChange[]; truncated: boolean }>;
-  /** Swaps the staged copy into the real workspace's place. */
-  commit(handle: TransactionHandle): Promise<void>;
+  /** Swaps the staged copy into the real workspace's place. Pass
+   * `keepUndoSnapshot: true` for a change a human actually reviewed and
+   * approved — that's the only case worth making undoable. The trivial
+   * auto-commit for a turn with zero file changes must NOT set this, or it
+   * would silently overwrite (and lose) an earlier real undo point. */
+  commit(handle: TransactionHandle, options?: { keepUndoSnapshot?: boolean }): Promise<void>;
   /** Discards the staged copy; the real workspace is untouched. */
   rollback(handle: TransactionHandle): Promise<void>;
   /** Removes any staging directories left over from an unclean shutdown. */
@@ -174,17 +178,40 @@ export interface WorkspaceTransactionManager {
   /** True if a staged copy already exists for this Agent — lets callers
    * avoid triggering a fresh copy (via begin) just to check. */
   hasActive(agentId: string): Promise<boolean>;
+  /** True if this Agent has a commit it can still undo. */
+  hasUndoSnapshot(agentId: string): Promise<boolean>;
+  /** Restores the workspace to exactly how it was before the last
+   * reviewed-and-confirmed commit. Single-level — like Ctrl+Z, not a full
+   * undo/redo stack: the just-undone state is discarded, not stacked back
+   * up as something to redo. Throws if there's nothing to undo. */
+  undo(agentId: string, persistentPath: string): Promise<void>;
+  /** Discards this Agent's undo snapshot, if any — used when deleting an
+   * Agent, so no orphaned snapshot is left behind. */
+  clearUndoSnapshot(agentId: string): Promise<void>;
 }
 
 export class FileSystemWorkspaceTransactionManager implements WorkspaceTransactionManager {
-  constructor(private readonly txRoot: string) {}
+  private readonly undoRoot: string;
+
+  constructor(private readonly txRoot: string) {
+    // A sibling of txRoot, not nested inside it, so cleanupStale() (which
+    // wipes everything under txRoot on every boot, since in-progress
+    // staging is never safe to trust after a restart) never touches undo
+    // snapshots — those represent real, committed history worth keeping.
+    this.undoRoot = path.join(path.dirname(txRoot), ".undo");
+  }
 
   private workingPathFor(agentId: string): string {
     return path.join(this.txRoot, agentId);
   }
 
+  private undoPathFor(agentId: string): string {
+    return path.join(this.undoRoot, agentId);
+  }
+
   async initialize(): Promise<void> {
     await mkdir(this.txRoot, { recursive: true });
+    await mkdir(this.undoRoot, { recursive: true });
   }
 
   async hasActive(agentId: string): Promise<boolean> {
@@ -207,17 +234,44 @@ export class FileSystemWorkspaceTransactionManager implements WorkspaceTransacti
     return computeChanges(handle.persistentPath, handle.workingPath);
   }
 
-  async commit(handle: TransactionHandle): Promise<void> {
+  async commit(handle: TransactionHandle, options: { keepUndoSnapshot?: boolean } = {}): Promise<void> {
     const previousPath = handle.persistentPath + ".prev-" + handle.agentId;
     await rm(previousPath, { recursive: true, force: true });
     await rename(handle.persistentPath, previousPath);
     await rename(handle.workingPath, handle.persistentPath);
     await carryForwardExcluded(previousPath, handle.persistentPath);
-    await rm(previousPath, { recursive: true, force: true });
+    if (options.keepUndoSnapshot) {
+      const undoPath = this.undoPathFor(handle.agentId);
+      await rm(undoPath, { recursive: true, force: true });
+      await rename(previousPath, undoPath);
+    } else {
+      await rm(previousPath, { recursive: true, force: true });
+    }
   }
 
   async rollback(handle: TransactionHandle): Promise<void> {
     await rm(handle.workingPath, { recursive: true, force: true });
+  }
+
+  async hasUndoSnapshot(agentId: string): Promise<boolean> {
+    return pathExists(this.undoPathFor(agentId));
+  }
+
+  async undo(agentId: string, persistentPath: string): Promise<void> {
+    const undoPath = this.undoPathFor(agentId);
+    if (!(await pathExists(undoPath))) {
+      throw new Error("No undo snapshot available for this Agent.");
+    }
+    const discardPath = persistentPath + ".undone-" + agentId;
+    await rm(discardPath, { recursive: true, force: true });
+    await rename(persistentPath, discardPath);
+    await rename(undoPath, persistentPath);
+    await carryForwardExcluded(discardPath, persistentPath);
+    await rm(discardPath, { recursive: true, force: true });
+  }
+
+  async clearUndoSnapshot(agentId: string): Promise<void> {
+    await rm(this.undoPathFor(agentId), { recursive: true, force: true });
   }
 
   async cleanupStale(): Promise<number> {

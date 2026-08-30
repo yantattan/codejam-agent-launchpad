@@ -95,4 +95,8 @@ export const api = {
     request<{ run: AgentRun }>("/api/runs/" + id + "/confirm", { method: "POST" }),
   discardRun: (id: string) =>
     request<{ run: AgentRun }>("/api/runs/" + id + "/discard", { method: "POST" }),
+  undoAvailable: (id: string) =>
+    request<{ available: boolean }>("/api/agents/" + id + "/undo"),
+  undoLastCommit: (id: string) =>
+    request<{ agent: Agent }>("/api/agents/" + id + "/undo", { method: "POST" }),
 };

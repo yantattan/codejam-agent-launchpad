@@ -60,11 +60,32 @@ function ScanFindingsList({ findings }: { findings: ScanFinding[] }) {
   );
 }
 
-function ScanSummary({ scan }: { scan: ScanVerdict }) {
+function ScanSummary({
+  scan,
+  undoAvailable,
+  busy,
+  onUndo,
+}: {
+  scan: ScanVerdict;
+  undoAvailable: boolean;
+  busy: boolean;
+  onUndo: () => void;
+}) {
   if (scan.findings.length === 0) {
     return (
       <div className="scan-summary scan-summary-clean">
         <span>✓</span> Injection scan: prompt and workspace files scanned, nothing found.
+        {undoAvailable && (
+          <button
+            type="button"
+            className="button button-ghost scan-summary-undo"
+            onClick={onUndo}
+            disabled={busy}
+            title="Revert the last confirmed change to this workspace"
+          >
+            Undo
+          </button>
+        )}
       </div>
     );
   }
@@ -263,6 +284,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [sessionChecked, setSessionChecked] = useState(false);
+  const [undoAvailable, setUndoAvailable] = useState(false);
   const messageEnd = useRef<HTMLDivElement>(null);
   const selectedIdRef = useRef<string | null>(null);
   const mountedRef = useRef(true);
@@ -288,6 +310,19 @@ export default function App() {
     const result = await api.messages(agentId);
     if (mountedRef.current && selectedIdRef.current === agentId) {
       setMessages(result.messages);
+    }
+  }, []);
+
+  // Undo availability only ever changes at two moments — confirming a
+  // proposal creates an undo point, using it consumes the only one there
+  // is — so this is called from just those two handlers plus the initial
+  // per-agent fetch, not on every poll tick.
+  const refreshUndoAvailability = useCallback(async (agentId: string) => {
+    try {
+      const { available } = await api.undoAvailable(agentId);
+      if (mountedRef.current && selectedIdRef.current === agentId) setUndoAvailable(available);
+    } catch {
+      // Non-critical — leave the button's current state on a transient error.
     }
   }, []);
 
@@ -345,10 +380,12 @@ export default function App() {
     setActiveRun(null);
     setShowSettings(false);
     setSending(false);
+    setUndoAvailable(false);
     if (!selectedId) {
       setMessages([]);
       return;
     }
+    void refreshUndoAvailability(selectedId);
     void Promise.all([refreshMessages(selectedId), api.runs(selectedId)])
       .then(([, result]) => {
         if (selectedIdRef.current !== selectedId) return;
@@ -363,7 +400,7 @@ export default function App() {
       .catch((reason) =>
         setError(reason instanceof Error ? reason.message : String(reason)),
       );
-  }, [refreshMessages, selectedId]);
+  }, [refreshMessages, refreshUndoAvailability, selectedId]);
 
   useEffect(() => {
     if (selected) {
@@ -501,7 +538,11 @@ export default function App() {
     try {
       const { run } = await api.confirmRun(runId);
       if (selectedIdRef.current === run.agentId) setActiveRun(run);
-      await Promise.all([refreshMessages(run.agentId), refreshAgents()]);
+      await Promise.all([
+        refreshMessages(run.agentId),
+        refreshAgents(),
+        refreshUndoAvailability(run.agentId),
+      ]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -516,6 +557,29 @@ export default function App() {
       const { run } = await api.discardRun(runId);
       if (selectedIdRef.current === run.agentId) setActiveRun(run);
       await Promise.all([refreshMessages(run.agentId), refreshAgents()]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const undoLastCommit = async () => {
+    if (!selected) return;
+    if (
+      !window.confirm(
+        "Undo the last confirmed change to " +
+          selected.name +
+          "'s workspace? This reverts those files to how they were before — it can't be redone.",
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.undoLastCommit(selected.id);
+      await Promise.all([refreshAgents(), refreshUndoAvailability(selected.id)]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -819,7 +883,12 @@ export default function App() {
                   </article>
                 )}
                 {!sending && activeRun?.status === "completed" && activeRun.scan && (
-                  <ScanSummary scan={activeRun.scan} />
+                  <ScanSummary
+                    scan={activeRun.scan}
+                    undoAvailable={undoAvailable}
+                    busy={busy}
+                    onUndo={() => void undoLastCommit()}
+                  />
                 )}
                 {!sending && activeRun?.status === "pending_confirmation" && (
                   <PendingChangesPanel

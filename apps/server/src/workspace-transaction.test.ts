@@ -159,6 +159,86 @@ describe("FileSystemWorkspaceTransactionManager — rollback", () => {
   });
 });
 
+describe("FileSystemWorkspaceTransactionManager — undo", () => {
+  it("has no undo snapshot until a commit explicitly asks to keep one", async () => {
+    const { persistentPath, manager } = await setup();
+    await writeFile(path.join(persistentPath, "notes.txt"), "v1", "utf8");
+    const handle = await manager.begin("agent-1", persistentPath);
+    await writeFile(path.join(handle.workingPath, "notes.txt"), "v2", "utf8");
+
+    await manager.commit(handle);
+
+    expect(await manager.hasUndoSnapshot("agent-1")).toBe(false);
+  });
+
+  it("restores the workspace to its state before a confirmed commit", async () => {
+    const { persistentPath, manager } = await setup();
+    await writeFile(path.join(persistentPath, "notes.txt"), "v1", "utf8");
+    const handle = await manager.begin("agent-1", persistentPath);
+    await writeFile(path.join(handle.workingPath, "notes.txt"), "v2", "utf8");
+
+    await manager.commit(handle, { keepUndoSnapshot: true });
+    expect(await manager.hasUndoSnapshot("agent-1")).toBe(true);
+    await expect(readFile(path.join(persistentPath, "notes.txt"), "utf8")).resolves.toBe("v2");
+
+    await manager.undo("agent-1", persistentPath);
+
+    await expect(readFile(path.join(persistentPath, "notes.txt"), "utf8")).resolves.toBe("v1");
+    // Single-level — like Ctrl+Z, not a stack: once used, there's nothing
+    // further to undo.
+    expect(await manager.hasUndoSnapshot("agent-1")).toBe(false);
+  });
+
+  it("a later plain commit does not clobber an earlier undo snapshot", async () => {
+    const { persistentPath, manager } = await setup();
+    await writeFile(path.join(persistentPath, "notes.txt"), "v1", "utf8");
+    const first = await manager.begin("agent-1", persistentPath);
+    await writeFile(path.join(first.workingPath, "notes.txt"), "v2", "utf8");
+    await manager.commit(first, { keepUndoSnapshot: true });
+
+    // A second, trivial turn with no real changes auto-commits without
+    // asking to keep an undo snapshot — this must not destroy the first one.
+    const second = await manager.begin("agent-1", persistentPath);
+    await manager.commit(second);
+
+    expect(await manager.hasUndoSnapshot("agent-1")).toBe(true);
+    await manager.undo("agent-1", persistentPath);
+    await expect(readFile(path.join(persistentPath, "notes.txt"), "utf8")).resolves.toBe("v1");
+  });
+
+  it("throws when there is nothing to undo", async () => {
+    const { persistentPath, manager } = await setup();
+    await expect(manager.undo("agent-1", persistentPath)).rejects.toThrow();
+  });
+
+  it("clearUndoSnapshot removes it without error even if none exists", async () => {
+    const { persistentPath, manager } = await setup();
+    await expect(manager.clearUndoSnapshot("agent-1")).resolves.toBeUndefined();
+
+    const handle = await manager.begin("agent-1", persistentPath);
+    await manager.commit(handle, { keepUndoSnapshot: true });
+    expect(await manager.hasUndoSnapshot("agent-1")).toBe(true);
+
+    await manager.clearUndoSnapshot("agent-1");
+    expect(await manager.hasUndoSnapshot("agent-1")).toBe(false);
+  });
+
+  it("cleanupStale never removes undo snapshots, only leftover staging directories", async () => {
+    const { persistentPath, manager } = await setup();
+    const handle = await manager.begin("agent-1", persistentPath);
+    await manager.commit(handle, { keepUndoSnapshot: true });
+    expect(await manager.hasUndoSnapshot("agent-1")).toBe(true);
+
+    // Simulate an unclean shutdown leaving a stale staging dir for another agent.
+    await manager.begin("agent-2", persistentPath);
+
+    await manager.cleanupStale();
+
+    expect(await manager.hasUndoSnapshot("agent-1")).toBe(true);
+    expect(await manager.hasActive("agent-2")).toBe(false);
+  });
+});
+
 describe("FileSystemWorkspaceTransactionManager — hasActive / cleanupStale", () => {
   it("hasActive is false before begin and true after", async () => {
     const { persistentPath, manager } = await setup();

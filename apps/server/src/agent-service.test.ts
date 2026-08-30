@@ -499,3 +499,122 @@ describe("Delete/modify confirmation gate", () => {
     await expect(service.discardRun(run.id, ownerA)).rejects.toMatchObject({ statusCode: 409 });
   });
 });
+
+describe("Undo middleware", () => {
+  it("canUndo is false for an Agent with no confirmed changes yet", async () => {
+    const { service } = await makeService();
+    const agent = await service.createAgent({ name: "Fresh" }, ownerA);
+    expect(await service.canUndo(agent.id, ownerA)).toBe(false);
+  });
+
+  it("undoLastCommit rejects when there is nothing to undo", async () => {
+    const { service } = await makeService();
+    const agent = await service.createAgent({ name: "Fresh" }, ownerA);
+    await expect(service.undoLastCommit(agent.id, ownerA)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it("confirming a proposal makes it undoable, and undo restores the real workspace", async () => {
+    const runner: AgentRunner = {
+      async run(request) {
+        await writeFile(path.join(request.workspacePath, "output.txt"), "generated", "utf8");
+        return { output: "wrote output.txt", threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service, workspaceRoot } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Writer" }, ownerA);
+    const { run } = await service.sendMessage(agent.id, "write output.txt", ownerA);
+    await expect.poll(async () => (await service.getRun(run.id, ownerA)).status).toBe("pending_confirmation");
+
+    expect(await service.canUndo(agent.id, ownerA)).toBe(false);
+    await service.confirmRun(run.id, ownerA);
+    expect(await service.canUndo(agent.id, ownerA)).toBe(true);
+    await expect(readFile(path.join(workspaceRoot, agent.id, "output.txt"), "utf8")).resolves.toBe("generated");
+
+    await service.undoLastCommit(agent.id, ownerA);
+
+    await expect(readFile(path.join(workspaceRoot, agent.id, "output.txt"), "utf8")).rejects.toThrow();
+    // Single-level — nothing left to undo a second time.
+    expect(await service.canUndo(agent.id, ownerA)).toBe(false);
+    await expect(service.undoLastCommit(agent.id, ownerA)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  it("a later plain conversational turn does not clobber an earlier undo point", async () => {
+    const runner: AgentRunner = {
+      async run(request) {
+        await writeFile(path.join(request.workspacePath, "output.txt"), "generated", "utf8");
+        return { output: "wrote output.txt", threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service, workspaceRoot } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Writer" }, ownerA);
+    const { run } = await service.sendMessage(agent.id, "write output.txt", ownerA);
+    await expect.poll(async () => (await service.getRun(run.id, ownerA)).status).toBe("pending_confirmation");
+    await service.confirmRun(run.id, ownerA);
+    expect(await service.canUndo(agent.id, ownerA)).toBe(true);
+
+    // A follow-up prompt that changes nothing auto-completes without ever
+    // touching the undo point from the confirmed write above.
+    const { run: secondRun } = await service.sendMessage(agent.id, "thanks!", ownerA);
+    await expect.poll(async () => (await service.getRun(secondRun.id, ownerA)).status).toBe("completed");
+
+    expect(await service.canUndo(agent.id, ownerA)).toBe(true);
+    await service.undoLastCommit(agent.id, ownerA);
+    await expect(readFile(path.join(workspaceRoot, agent.id, "output.txt"), "utf8")).rejects.toThrow();
+  });
+
+  it("rejects undo while a run is active or pending confirmation", async () => {
+    const runner: AgentRunner = {
+      async run(request) {
+        await writeFile(path.join(request.workspacePath, "output.txt"), "generated", "utf8");
+        return { output: "wrote output.txt", threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Writer" }, ownerA);
+    const { run } = await service.sendMessage(agent.id, "write output.txt", ownerA);
+    await expect.poll(async () => (await service.getRun(run.id, ownerA)).status).toBe("pending_confirmation");
+
+    await expect(service.undoLastCommit(agent.id, ownerA)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("hides undo behind ownership, same as every other Agent action", async () => {
+    const runner: AgentRunner = {
+      async run(request) {
+        await writeFile(path.join(request.workspacePath, "output.txt"), "generated", "utf8");
+        return { output: "wrote output.txt", threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Writer" }, ownerA);
+    const { run } = await service.sendMessage(agent.id, "write output.txt", ownerA);
+    await expect.poll(async () => (await service.getRun(run.id, ownerA)).status).toBe("pending_confirmation");
+    await service.confirmRun(run.id, ownerA);
+
+    await expect(service.canUndo(agent.id, ownerB)).rejects.toMatchObject({ statusCode: 404 });
+    await expect(service.undoLastCommit(agent.id, ownerB)).rejects.toMatchObject({ statusCode: 404 });
+  });
+});

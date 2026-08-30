@@ -129,6 +129,16 @@ export async function createApp(
     return { runs: await service.getRuns(id, requireUserId(request)) };
   });
 
+  app.get("/api/agents/:id/undo", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return { available: await service.canUndo(id, requireUserId(request)) };
+  });
+
+  app.post("/api/agents/:id/undo", async (request) => {
+    const { id } = agentIdParams.parse(request.params);
+    return { agent: await service.undoLastCommit(id, requireUserId(request)) };
+  });
+
   app.post("/api/agents/:id/messages", async (request, reply) => {
     const { id } = agentIdParams.parse(request.params);
     const body = messageBody.parse(request.body);

@@ -116,6 +116,7 @@ export class AgentService {
     const agent = await this.getAgent(id, ownerId);
     await this.cancelExecution(id);
     await this.discardPendingTransactionIfAny(agent);
+    await this.transactions.clearUndoSnapshot(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.repository.deleteAgent(id, ownerId);
     return { archivedWorkspace };
@@ -149,7 +150,10 @@ export class AgentService {
       throw new HttpError(409, "This proposal has been superseded by a newer one");
     }
     const handle = await this.transactions.begin(agent.id, agent.workspacePath);
-    await this.transactions.commit(handle);
+    // Only an explicit, human-reviewed confirm creates an undo point — the
+    // trivial auto-commit for a no-change turn (elsewhere in this file)
+    // deliberately does not, so it can never clobber a real one.
+    await this.transactions.commit(handle, { keepUndoSnapshot: true });
     const completedAt = now();
     const updated = await this.repository.updateRun(runId, { status: "completed", completedAt });
     if (!updated) {
@@ -185,6 +189,35 @@ export class AgentService {
       await this.repository.updateAgent(agent.id, ownerId, { status: "ready", updatedAt: completedAt });
     }
     return updated;
+  }
+
+  /**
+   * True if this Agent has a confirmed change it can still undo. Read-only —
+   * used by the UI to decide whether to show the Undo action at all.
+   */
+  async canUndo(agentId: string, ownerId: string): Promise<boolean> {
+    await this.getAgent(agentId, ownerId);
+    return this.transactions.hasUndoSnapshot(agentId);
+  }
+
+  /**
+   * Reverts the Agent's real workspace to exactly how it was before the
+   * last confirmed change — a single, non-stacking Ctrl+Z, independent of
+   * the confirmation gate above (this undoes a change that already made it
+   * into the real workspace, not a pending proposal). Only ever touches
+   * files; conversation history and run records are untouched, since
+   * they're a record of what happened, not workspace state to roll back.
+   */
+  async undoLastCommit(agentId: string, ownerId: string): Promise<Agent> {
+    const agent = await this.getAgent(agentId, ownerId);
+    if (agent.status === "busy") {
+      throw new HttpError(409, "Wait for the active run to finish before undoing");
+    }
+    if (!(await this.transactions.hasUndoSnapshot(agentId))) {
+      throw new HttpError(404, "Nothing to undo for this Agent");
+    }
+    await this.transactions.undo(agentId, agent.workspacePath);
+    return agent;
   }
 
   async getMessages(agentId: string, ownerId: string): Promise<Message[]> {
