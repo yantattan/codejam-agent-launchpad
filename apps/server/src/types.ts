@@ -5,7 +5,9 @@ export type RunStatus =
   | "completed"
   | "failed"
   | "cancelled"
-  | "blocked";
+  | "blocked"
+  | "pending_confirmation"
+  | "discarded";
 export type MessageRole = "user" | "assistant";
 
 export type ScanTargetSource = "prompt" | "workspace-file";
@@ -60,6 +62,38 @@ export interface RunUsage {
   outputTokens?: number;
 }
 
+export type FileChangeKind = "created" | "modified" | "deleted";
+
+export interface DiffLine {
+  value: string;
+  added?: boolean;
+  removed?: boolean;
+}
+
+export interface FileChange {
+  /** Relative to the Agent's workspace root, forward-slash separated. */
+  path: string;
+  kind: FileChangeKind;
+  isBinary: boolean;
+  /** Bytes, null if the file did not exist before this run. */
+  sizeBefore: number | null;
+  /** Bytes, null if the file was deleted. */
+  sizeAfter: number | null;
+  /** Line-by-line diff, only present for modified text files. */
+  diff?: DiffLine[];
+  /** Full new content, only present for created text files. */
+  contentAfter?: string;
+  /** Full old content, only present for deleted text files. */
+  contentBefore?: string;
+}
+
+export interface PendingChangeSet {
+  files: FileChange[];
+  /** True if the change set hit a size/count cap and some files were
+   * reported without diff/content detail. */
+  truncated: boolean;
+}
+
 export interface AgentRun {
   id: string;
   agentId: string;
@@ -72,6 +106,7 @@ export interface AgentRun {
   completedAt: string | null;
   createdAt: string;
   scan: ScanVerdict | null;
+  pendingChanges: PendingChangeSet | null;
 }
 
 export interface Database {

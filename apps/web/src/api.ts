@@ -78,4 +78,8 @@ export const api = {
       },
     ),
   run: (id: string) => request<{ run: AgentRun }>("/api/runs/" + id),
+  confirmRun: (id: string) =>
+    request<{ run: AgentRun }>("/api/runs/" + id + "/confirm", { method: "POST" }),
+  discardRun: (id: string) =>
+    request<{ run: AgentRun }>("/api/runs/" + id + "/discard", { method: "POST" }),
 };

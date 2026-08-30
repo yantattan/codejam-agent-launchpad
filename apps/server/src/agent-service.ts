@@ -14,6 +14,7 @@ import type {
   UpdateAgentInput,
 } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
+import type { TransactionHandle, WorkspaceTransactionManager } from "./workspace-transaction.js";
 
 const now = () => new Date().toISOString();
 
@@ -44,14 +45,16 @@ export class AgentService {
     private readonly workspaces: WorkspaceManager,
     private readonly runner: AgentRunner,
     private readonly scanner: InjectionScanner,
+    private readonly transactions: WorkspaceTransactionManager,
   ) {}
 
   async initialize(): Promise<void> {
     await this.store.initialize();
     await this.workspaces.initialize();
+    await this.transactions.initialize();
     await this.store.mutate((database) => {
       for (const run of database.runs) {
-        if (run.status === "queued" || run.status === "running") {
+        if (run.status === "queued" || run.status === "running" || run.status === "pending_confirmation") {
           run.status = "cancelled";
           run.error = "Server restarted while this run was active";
           run.completedAt = now();
@@ -64,6 +67,7 @@ export class AgentService {
         }
       }
     });
+    await this.transactions.cleanupStale();
   }
 
   listAgents(): Agent[] {
@@ -127,6 +131,7 @@ export class AgentService {
   async deleteAgent(id: string): Promise<{ archivedWorkspace: string }> {
     const agent = this.getAgent(id);
     await this.cancelExecution(id);
+    await this.discardPendingTransactionIfAny(id);
     const archivedWorkspace = await this.workspaces.archive(agent);
     await this.store.mutate((database) => {
       database.agents = database.agents.filter((item) => item.id !== id);
@@ -143,7 +148,74 @@ export class AgentService {
   async stopAgent(id: string): Promise<Agent> {
     this.getAgent(id);
     await this.cancelExecution(id);
+    await this.discardPendingTransactionIfAny(id);
     return this.setStatus(id, "stopped");
+  }
+
+  /**
+   * Confirms a pending proposal: swaps the staged copy into the real
+   * workspace. Guarded against acting on a stale run — if a follow-up
+   * refinement has already produced a newer pending run for this Agent,
+   * that newer one is the only one still backed by a live staging copy.
+   */
+  async confirmRun(runId: string): Promise<AgentRun> {
+    const run = this.getRun(runId);
+    const agent = this.getAgent(run.agentId);
+    if (run.status !== "pending_confirmation") {
+      throw new HttpError(409, "This run is not awaiting confirmation");
+    }
+    if (this.latestRun(agent.id)?.id !== run.id) {
+      throw new HttpError(409, "This proposal has been superseded by a newer one");
+    }
+    const handle = await this.transactions.begin(agent.id, agent.workspacePath);
+    await this.transactions.commit(handle);
+    return this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === runId);
+      const storedAgent = database.agents.find((item) => item.id === agent.id);
+      if (!storedRun) {
+        throw new HttpError(404, "Run not found");
+      }
+      const completedAt = now();
+      storedRun.status = "completed";
+      storedRun.completedAt = completedAt;
+      if (storedAgent && storedAgent.status !== "stopped") {
+        storedAgent.status = "ready";
+        storedAgent.updatedAt = completedAt;
+      }
+      return structuredClone(storedRun);
+    });
+  }
+
+  /**
+   * Discards a pending proposal: the staged copy is deleted, the real
+   * workspace was never touched. Same staleness guard as confirmRun.
+   */
+  async discardRun(runId: string): Promise<AgentRun> {
+    const run = this.getRun(runId);
+    const agent = this.getAgent(run.agentId);
+    if (run.status !== "pending_confirmation") {
+      throw new HttpError(409, "This run is not awaiting confirmation");
+    }
+    if (this.latestRun(agent.id)?.id !== run.id) {
+      throw new HttpError(409, "This proposal has been superseded by a newer one");
+    }
+    const handle = await this.transactions.begin(agent.id, agent.workspacePath);
+    await this.transactions.rollback(handle);
+    return this.store.mutate((database) => {
+      const storedRun = database.runs.find((item) => item.id === runId);
+      const storedAgent = database.agents.find((item) => item.id === agent.id);
+      if (!storedRun) {
+        throw new HttpError(404, "Run not found");
+      }
+      const completedAt = now();
+      storedRun.status = "discarded";
+      storedRun.completedAt = completedAt;
+      if (storedAgent && storedAgent.status !== "stopped") {
+        storedAgent.status = "ready";
+        storedAgent.updatedAt = completedAt;
+      }
+      return structuredClone(storedRun);
+    });
   }
 
   getMessages(agentId: string): Message[] {
@@ -203,6 +275,7 @@ export class AgentService {
       completedAt: null,
       createdAt: timestamp,
       scan: promptScan,
+      pendingChanges: null,
     };
     const message: Message = {
       id: randomUUID(),
@@ -221,7 +294,15 @@ export class AgentService {
         throw new HttpError(409, "Start the Agent before sending a message");
       }
       if (storedAgent.status === "busy") {
-        throw new HttpError(409, "This Agent is already running");
+        // A follow-up message while a proposal is awaiting confirmation is
+        // a refinement of that same proposal, not a conflicting new task —
+        // everything else still counts as "already running".
+        const latest = database.runs
+          .filter((item) => item.agentId === agentId)
+          .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+        if (latest?.status !== "pending_confirmation") {
+          throw new HttpError(409, "This Agent is already running");
+        }
       }
       database.runs.push(run);
       database.messages.push(message);
@@ -274,20 +355,29 @@ export class AgentService {
         storedRun.startedAt = now();
       }
     });
+    let handle: TransactionHandle | null = null;
     try {
       if (this.cancellationRequests.has(agentAtStart.id)) {
         throw new RunCancelledError();
       }
 
+      // Every run works in an isolated staged copy of the workspace — the
+      // real one is only ever touched at explicit user confirmation. If a
+      // proposal from an earlier turn is still pending, this reuses that
+      // same staged copy instead of starting over, so a follow-up prompt
+      // refines the same proposal rather than losing it.
+      handle = await this.transactions.begin(agentAtStart.id, agentAtStart.workspacePath);
+
       // Scan the workspace on every turn (including resumed threads) —
       // this is what Codex is about to read this turn, and catches content
       // that arrived after the Agent was created (a file added between
-      // turns, or by a prior turn's own output).
+      // turns, or by a prior turn's own output). Scanned from the staged
+      // copy, since that's what the Runner is about to actually read.
       const {
         files,
         truncated: filesTruncated,
         extraFindings,
-      } = await this.workspaces.readScannableFiles(agentAtStart);
+      } = await this.workspaces.readScannableFiles({ ...agentAtStart, workspacePath: handle.workingPath });
       const fileScan = await this.scanner.scan(
         agentAtStart,
         files.map((file) => ({ source: "workspace-file" as const, path: file.path, text: file.content })),
@@ -303,6 +393,10 @@ export class AgentService {
       };
 
       if (combinedScan.blocked) {
+        // Fail closed: a scan hit means the whole pending proposal is
+        // discarded, not just this turn's delta — nothing suspect stays
+        // staged waiting for a later confirm.
+        await this.transactions.rollback(handle);
         const completedAt = now();
         await this.store.mutate((database) => {
           const storedRun = database.runs.find((item) => item.id === run.id);
@@ -323,19 +417,55 @@ export class AgentService {
 
       const result = await this.runner.run({
         agentId: agentAtStart.id,
-        workspacePath: agentAtStart.workspacePath,
+        workspacePath: handle.workingPath,
         prompt: run.prompt,
         threadId: agentAtStart.codexThreadId,
       });
+
+      const { files: changedFiles, truncated: changesTruncated } = await this.transactions.diffChanges(handle);
       const completedAt = now();
+
+      if (changedFiles.length === 0) {
+        // Nothing to review — commit is a same-content swap, so this stays
+        // as frictionless as a plain Q&A turn always was.
+        await this.transactions.commit(handle);
+        await this.store.mutate((database) => {
+          const storedRun = database.runs.find((item) => item.id === run.id);
+          const agent = database.agents.find((item) => item.id === agentAtStart.id);
+          if (!storedRun || !agent) return;
+          storedRun.status = "completed";
+          storedRun.output = result.output;
+          storedRun.usage = result.usage;
+          storedRun.scan = combinedScan;
+          storedRun.pendingChanges = null;
+          storedRun.completedAt = completedAt;
+          database.messages.push({
+            id: randomUUID(),
+            agentId: agent.id,
+            runId: run.id,
+            role: "assistant",
+            content: result.output,
+            createdAt: completedAt,
+          });
+          agent.status = "ready";
+          agent.codexThreadId = result.threadId;
+          agent.lastError = null;
+          agent.updatedAt = completedAt;
+        });
+        return;
+      }
+
+      // Files changed — hold for the user's review. The real workspace
+      // has not been touched; the Agent stays "busy" until confirm/discard.
       await this.store.mutate((database) => {
         const storedRun = database.runs.find((item) => item.id === run.id);
         const agent = database.agents.find((item) => item.id === agentAtStart.id);
         if (!storedRun || !agent) return;
-        storedRun.status = "completed";
+        storedRun.status = "pending_confirmation";
         storedRun.output = result.output;
         storedRun.usage = result.usage;
         storedRun.scan = combinedScan;
+        storedRun.pendingChanges = { files: changedFiles, truncated: changesTruncated };
         storedRun.completedAt = completedAt;
         database.messages.push({
           id: randomUUID(),
@@ -345,12 +475,14 @@ export class AgentService {
           content: result.output,
           createdAt: completedAt,
         });
-        agent.status = "ready";
         agent.codexThreadId = result.threadId;
         agent.lastError = null;
         agent.updatedAt = completedAt;
       });
     } catch (error) {
+      if (handle) {
+        await this.transactions.rollback(handle).catch(() => undefined);
+      }
       const completedAt = now();
       const cancelled = error instanceof RunCancelledError;
       const message = error instanceof Error ? error.message : String(error);
@@ -400,5 +532,30 @@ export class AgentService {
     } finally {
       this.cancellationRequests.delete(agentId);
     }
+  }
+
+  private latestRun(agentId: string): AgentRun | undefined {
+    return this.store
+      .snapshot()
+      .runs.filter((run) => run.agentId === agentId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+  }
+
+  /** Used when stopping or deleting an Agent that has a proposal still
+   * awaiting review — leaves no orphaned staging directory and no run
+   * stuck forever in "pending_confirmation". */
+  private async discardPendingTransactionIfAny(agentId: string): Promise<void> {
+    if (!(await this.transactions.hasActive(agentId))) return;
+    const agent = this.getAgent(agentId);
+    const handle = await this.transactions.begin(agentId, agent.workspacePath);
+    await this.transactions.rollback(handle);
+    await this.store.mutate((database) => {
+      for (const run of database.runs) {
+        if (run.agentId === agentId && run.status === "pending_confirmation") {
+          run.status = "discarded";
+          run.completedAt = now();
+        }
+      }
+    });
   }
 }

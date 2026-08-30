@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, setAuthToken } from "./api";
-import type { Agent, AgentRun, Message, ScanFinding, ScanVerdict, SystemInfo } from "./types";
+import type { Agent, AgentRun, FileChange, Message, ScanFinding, ScanVerdict, SystemInfo } from "./types";
 
 const starterPrompts = [
   "Create a small TypeScript CLI that prints a weather summary from sample JSON.",
@@ -70,6 +70,138 @@ function ScanSummary({ scan }: { scan: ScanVerdict }) {
     <article className="scan-warning">
       <strong>Injection scan flagged {scan.findings.length} item(s) — run proceeded</strong>
       <ScanFindingsList findings={scan.findings} />
+    </article>
+  );
+}
+
+function FileChangeBadge({ kind }: { kind: FileChange["kind"] }) {
+  return <span className={"file-change-badge file-change-" + kind}>{kind}</span>;
+}
+
+function FileChangeDetail({ file }: { file: FileChange }) {
+  if (file.isBinary) {
+    return (
+      <p className="file-change-binary-note">
+        Binary file — {file.sizeBefore ?? "new"} → {file.sizeAfter ?? "removed"} bytes.
+      </p>
+    );
+  }
+  if (file.kind === "modified" && file.diff) {
+    return (
+      <pre className="file-diff">
+        <code>
+          {file.diff.map((line, index) => (
+            <span
+              key={index}
+              className={
+                "diff-line " +
+                (line.added
+                  ? "diff-line-added"
+                  : line.removed
+                    ? "diff-line-removed"
+                    : "diff-line-context")
+              }
+            >
+              {line.value}
+            </span>
+          ))}
+        </code>
+      </pre>
+    );
+  }
+  if (file.kind === "created" && file.contentAfter !== undefined) {
+    return (
+      <pre className="file-diff">
+        <code>{file.contentAfter}</code>
+      </pre>
+    );
+  }
+  if (file.kind === "deleted" && file.contentBefore !== undefined) {
+    return (
+      <pre className="file-diff">
+        <code>{file.contentBefore}</code>
+      </pre>
+    );
+  }
+  return null;
+}
+
+function FileChangeRow({
+  file,
+  expanded,
+  onToggle,
+}: {
+  file: FileChange;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <li className="file-change-row">
+      <button type="button" className="file-change-row-header" onClick={onToggle}>
+        <span className={"file-change-caret " + (expanded ? "expanded" : "")}>▸</span>
+        <FileChangeBadge kind={file.kind} />
+        <code>{file.path}</code>
+      </button>
+      {expanded && <div className="file-change-body"><FileChangeDetail file={file} /></div>}
+    </li>
+  );
+}
+
+function PendingChangesPanel({
+  run,
+  busy,
+  onConfirm,
+  onDiscard,
+}: {
+  run: AgentRun;
+  busy: boolean;
+  onConfirm: () => void;
+  onDiscard: () => void;
+}) {
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+  const files = run.pendingChanges?.files ?? [];
+
+  const toggle = (path: string) => {
+    setExpandedPaths((current) => {
+      const next = new Set(current);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  };
+
+  return (
+    <article className="scan-warning pending-changes-panel">
+      <strong>
+        Codex proposes {files.length} file change{files.length === 1 ? "" : "s"} — review before
+        applying
+      </strong>
+      <ul className="file-change-list">
+        {files.map((file) => (
+          <FileChangeRow
+            key={file.path}
+            file={file}
+            expanded={expandedPaths.has(file.path)}
+            onToggle={() => toggle(file.path)}
+          />
+        ))}
+      </ul>
+      {run.pendingChanges?.truncated && (
+        <p className="file-change-truncated-note">
+          Some files were too large to fully diff and were reported without detail.
+        </p>
+      )}
+      <div className="pending-changes-actions">
+        <button type="button" className="button button-danger" onClick={onDiscard} disabled={busy}>
+          Discard
+        </button>
+        <button type="button" className="button button-primary" onClick={onConfirm} disabled={busy}>
+          Confirm &amp; Apply
+        </button>
+      </div>
     </article>
   );
 }
@@ -281,6 +413,34 @@ export default function App() {
       setError(reason instanceof Error ? reason.message : String(reason));
       setActiveRun(null);
       await refreshAgents();
+    }
+  };
+
+  const confirmPendingRun = async (runId: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const { run } = await api.confirmRun(runId);
+      if (selectedIdRef.current === run.agentId) setActiveRun(run);
+      await Promise.all([refreshMessages(run.agentId), refreshAgents()]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const discardPendingRun = async (runId: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const { run } = await api.discardRun(runId);
+      if (selectedIdRef.current === run.agentId) setActiveRun(run);
+      await Promise.all([refreshMessages(run.agentId), refreshAgents()]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -587,6 +747,20 @@ export default function App() {
                 {activeRun?.status === "completed" && activeRun.scan && (
                   <ScanSummary scan={activeRun.scan} />
                 )}
+                {activeRun?.status === "pending_confirmation" && (
+                  <PendingChangesPanel
+                    run={activeRun}
+                    busy={busy}
+                    onConfirm={() => void confirmPendingRun(activeRun.id)}
+                    onDiscard={() => void discardPendingRun(activeRun.id)}
+                  />
+                )}
+                {activeRun?.status === "discarded" && (
+                  <article className="run-error scan-discarded">
+                    <strong>Proposal discarded</strong>
+                    <span>You reviewed the proposed changes and discarded them — nothing was changed.</span>
+                  </article>
+                )}
                 <div ref={messageEnd} />
               </div>
 
@@ -603,12 +777,14 @@ export default function App() {
                   placeholder={
                     selected.status === "stopped"
                       ? "Start this Agent to continue…"
-                      : "Describe what you want the Agent to do…"
+                      : activeRun?.status === "pending_confirmation"
+                        ? "Ask Codex to adjust the proposed changes…"
+                        : "Describe what you want the Agent to do…"
                   }
                   disabled={
                     selected.status === "stopped" ||
-                    selected.status === "busy" ||
-                    activeRun != null && ["queued", "running"].includes(activeRun.status)
+                    (selected.status === "busy" && activeRun?.status !== "pending_confirmation") ||
+                    (activeRun != null && ["queued", "running"].includes(activeRun.status))
                   }
                   rows={3}
                 />
@@ -621,7 +797,7 @@ export default function App() {
                     disabled={
                       !prompt.trim() ||
                       selected.status === "stopped" ||
-                      selected.status === "busy" ||
+                      (selected.status === "busy" && activeRun?.status !== "pending_confirmation") ||
                       (activeRun != null && ["queued", "running"].includes(activeRun.status))
                     }
                     aria-label="Send message"

@@ -5,7 +5,9 @@ export type RunStatus =
   | "completed"
   | "failed"
   | "cancelled"
-  | "blocked";
+  | "blocked"
+  | "pending_confirmation"
+  | "discarded";
 
 export type ScanSeverity = "info" | "suspicious" | "malicious";
 
@@ -48,6 +50,30 @@ export interface Message {
   createdAt: string;
 }
 
+export type FileChangeKind = "created" | "modified" | "deleted";
+
+export interface DiffLine {
+  value: string;
+  added?: boolean;
+  removed?: boolean;
+}
+
+export interface FileChange {
+  path: string;
+  kind: FileChangeKind;
+  isBinary: boolean;
+  sizeBefore: number | null;
+  sizeAfter: number | null;
+  diff?: DiffLine[];
+  contentAfter?: string;
+  contentBefore?: string;
+}
+
+export interface PendingChangeSet {
+  files: FileChange[];
+  truncated: boolean;
+}
+
 export interface AgentRun {
   id: string;
   agentId: string;
@@ -62,6 +88,7 @@ export interface AgentRun {
   } | null;
   createdAt: string;
   scan: ScanVerdict | null;
+  pendingChanges: PendingChangeSet | null;
 }
 
 export interface SystemInfo {

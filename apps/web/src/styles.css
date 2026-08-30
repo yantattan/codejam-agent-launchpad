@@ -907,6 +907,145 @@ textarea:focus {
   font-size: 11px;
 }
 
+.scan-discarded {
+  border-left-color: #8a8a82;
+  background: #f1f0ec;
+  color: #5c5c54;
+}
+
+.pending-changes-panel {
+  gap: 8px;
+}
+
+.file-change-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.file-change-row {
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.file-change-row:last-child {
+  border-bottom: none;
+}
+
+.file-change-row-header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+
+.file-change-row-header:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.file-change-row-header code {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.file-change-caret {
+  display: inline-block;
+  transition: transform 0.12s ease;
+  opacity: 0.6;
+  flex: none;
+}
+
+.file-change-caret.expanded {
+  transform: rotate(90deg);
+}
+
+.file-change-badge {
+  flex: none;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 8px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.file-change-created {
+  background: #dcf1e7;
+  color: var(--green);
+}
+
+.file-change-modified {
+  background: #fff2c6;
+  color: #8a6a17;
+}
+
+.file-change-deleted {
+  background: #f6dfdc;
+  color: var(--red);
+}
+
+.file-change-body {
+  padding: 0 9px 9px;
+}
+
+.file-change-binary-note {
+  margin: 0;
+  font-size: 10px;
+  opacity: 0.75;
+}
+
+.file-diff {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.05);
+  padding: 8px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.diff-line {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.diff-line-added {
+  background: rgba(51, 144, 109, 0.16);
+  color: #256349;
+}
+
+.diff-line-removed {
+  background: rgba(197, 83, 83, 0.16);
+  color: #9e4545;
+}
+
+.file-change-truncated-note {
+  margin: 0;
+  font-size: 10px;
+  opacity: 0.75;
+}
+
+.pending-changes-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+}
+
 .composer {
   margin: 0;
   border-top: 1px solid #e1dfd8;

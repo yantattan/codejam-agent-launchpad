@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import { InjectionScanner, type SemanticJudge } from "./injection-scanner.js";
 import { JsonStore } from "./store.js";
 import type { AgentRunner, RunnerRequest, RunnerResult, ScanFinding } from "./types.js";
 import { WorkspaceManager } from "./workspace.js";
+import { FileSystemWorkspaceTransactionManager } from "./workspace-transaction.js";
 
 class FakeRunner implements AgentRunner {
   async run(request: RunnerRequest): Promise<RunnerResult> {
@@ -36,7 +37,6 @@ class FakeSemanticJudge implements SemanticJudge {
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
-  const { rm } = await import("node:fs/promises");
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true }),
@@ -64,6 +64,7 @@ async function makeService(
     new WorkspaceManager(path.join(root, "workspaces")),
     runner,
     scanner,
+    new FileSystemWorkspaceTransactionManager(path.join(root, "tx")),
   );
   await service.initialize();
   return { service, workspaceRoot: path.join(root, "workspaces") };
@@ -235,5 +236,143 @@ describe("Prompt-injection scanning", () => {
         .getRun(secondRun.id)
         .scan?.findings.some((item) => item.path === "notes.txt" && item.technique === "fake-system-message"),
     ).toBe(true);
+  });
+});
+
+describe("Delete/modify confirmation gate", () => {
+  it("a run that changes no files completes immediately, no confirmation needed", async () => {
+    const { service } = await makeService();
+    const agent = await service.createAgent({ name: "Chatter" });
+    const { run } = await service.sendMessage(agent.id, "just answer a question, no file changes");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+    expect(service.getRun(run.id).pendingChanges).toBeNull();
+  });
+
+  it("a run that creates a file lands in pending_confirmation with the real workspace untouched", async () => {
+    const runner: AgentRunner = {
+      async run(request) {
+        await writeFile(path.join(request.workspacePath, "output.txt"), "generated", "utf8");
+        return { output: "wrote output.txt", threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service, workspaceRoot } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Writer" });
+
+    const { run } = await service.sendMessage(agent.id, "write output.txt");
+    await expect.poll(() => service.getRun(run.id).status).toBe("pending_confirmation");
+    expect(service.getRun(run.id).pendingChanges?.files).toEqual([
+      expect.objectContaining({ path: "output.txt", kind: "created", contentAfter: "generated" }),
+    ]);
+    expect(service.getAgent(agent.id).status).toBe("busy");
+    await expect(readFile(path.join(workspaceRoot, agent.id, "output.txt"), "utf8")).rejects.toThrow();
+  });
+
+  it("confirmRun applies the staged change to the real workspace and returns the Agent to ready", async () => {
+    const runner: AgentRunner = {
+      async run(request) {
+        await writeFile(path.join(request.workspacePath, "output.txt"), "generated", "utf8");
+        return { output: "wrote output.txt", threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service, workspaceRoot } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Writer" });
+    const { run } = await service.sendMessage(agent.id, "write output.txt");
+    await expect.poll(() => service.getRun(run.id).status).toBe("pending_confirmation");
+
+    const confirmed = await service.confirmRun(run.id);
+    expect(confirmed.status).toBe("completed");
+    expect(service.getAgent(agent.id).status).toBe("ready");
+    await expect(readFile(path.join(workspaceRoot, agent.id, "output.txt"), "utf8")).resolves.toBe("generated");
+  });
+
+  it("discardRun leaves the real workspace untouched", async () => {
+    const runner: AgentRunner = {
+      async run(request) {
+        await rm(path.join(request.workspacePath, "old.txt"));
+        return { output: "removed old.txt", threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service, workspaceRoot } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Deleter" });
+    await writeFile(path.join(workspaceRoot, agent.id, "old.txt"), "keep me?", "utf8");
+
+    const { run } = await service.sendMessage(agent.id, "delete old.txt");
+    await expect.poll(() => service.getRun(run.id).status).toBe("pending_confirmation");
+    expect(service.getRun(run.id).pendingChanges?.files).toEqual([
+      expect.objectContaining({ path: "old.txt", kind: "deleted" }),
+    ]);
+
+    const discarded = await service.discardRun(run.id);
+    expect(discarded.status).toBe("discarded");
+    expect(service.getAgent(agent.id).status).toBe("ready");
+    await expect(readFile(path.join(workspaceRoot, agent.id, "old.txt"), "utf8")).resolves.toBe("keep me?");
+  });
+
+  it("a follow-up message while pending_confirmation refines the same staged copy in place", async () => {
+    let callCount = 0;
+    const readingsBeforeWrite: string[] = [];
+    const runner: AgentRunner = {
+      async run(request) {
+        callCount++;
+        const filePath = path.join(request.workspacePath, "state.txt");
+        const existing = await readFile(filePath, "utf8").catch(() => "");
+        readingsBeforeWrite.push(existing);
+        await writeFile(filePath, "v" + callCount, "utf8");
+        return { output: "turn " + callCount, threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Refiner" });
+
+    const { run: firstRun } = await service.sendMessage(agent.id, "first attempt");
+    await expect.poll(() => service.getRun(firstRun.id).status).toBe("pending_confirmation");
+    expect(readingsBeforeWrite[0]).toBe("");
+
+    const { run: secondRun } = await service.sendMessage(agent.id, "actually, tweak it");
+    await expect.poll(() => service.getRun(secondRun.id).status).toBe("pending_confirmation");
+    // Proves the SAME staged copy was reused across turns: turn 2 saw turn
+    // 1's write ("v1"), which would be impossible if a fresh copy of the
+    // (still file-less) real workspace had been made instead.
+    expect(readingsBeforeWrite[1]).toBe("v1");
+    expect(service.getAgent(agent.id).codexThreadId).toBe("fake-thread");
+    expect(service.getAgent(agent.id).status).toBe("busy");
+
+    // The superseded first run is no longer actionable.
+    await expect(service.confirmRun(firstRun.id)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.discardRun(firstRun.id)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("confirmRun and discardRun reject a run that is not awaiting confirmation", async () => {
+    const { service } = await makeService();
+    const agent = await service.createAgent({ name: "Chatter" });
+    const { run } = await service.sendMessage(agent.id, "hello");
+    await expect.poll(() => service.getRun(run.id).status).toBe("completed");
+
+    await expect(service.confirmRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.discardRun(run.id)).rejects.toMatchObject({ statusCode: 409 });
   });
 });
