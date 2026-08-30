@@ -40,6 +40,7 @@ const envSchema = z.object({
     .default("https://ark.cn-beijing.volces.com/api/v3"),
   SUPABASE_URL: z.string().url().optional(),
   SUPABASE_ANON_KEY: z.string().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 });
 
@@ -75,6 +76,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env) {
     arkBaseUrl: env.ARK_BASE_URL.replace(/\/+$/, ""),
     supabaseUrl: env.SUPABASE_URL?.trim() ?? "",
     supabaseAnonKey: env.SUPABASE_ANON_KEY?.trim() ?? "",
+    supabaseServiceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY?.trim() ?? "",
     nodeEnv: env.NODE_ENV,
   };
 }
@@ -94,6 +96,17 @@ export function isSupabaseConfigured(config: AppConfig): boolean {
     !config.supabaseUrl.includes("your-project-ref") &&
     config.supabaseAnonKey.length > 0 &&
     !config.supabaseAnonKey.startsWith("replace-")
+  );
+}
+
+/** Whether Agents/Messages/Runs should be persisted to Postgres instead of
+ * the local JSON file. Requires the service_role key in addition to the
+ * anon key auth alone needs. */
+export function isSupabaseDataStoreConfigured(config: AppConfig): boolean {
+  return (
+    isSupabaseConfigured(config) &&
+    config.supabaseServiceRoleKey.length > 0 &&
+    !config.supabaseServiceRoleKey.startsWith("replace-")
   );
 }
 

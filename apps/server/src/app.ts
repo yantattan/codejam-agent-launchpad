@@ -84,7 +84,7 @@ export async function createApp(
   app.get("/api/system", async () => service.systemInfo());
 
   app.get("/api/agents", async (request) => ({
-    agents: service.listAgents(requireUserId(request)),
+    agents: await service.listAgents(requireUserId(request)),
   }));
 
   app.post("/api/agents", async (request, reply) => {
@@ -95,7 +95,7 @@ export async function createApp(
 
   app.get("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { agent: service.getAgent(id, requireUserId(request)) };
+    return { agent: await service.getAgent(id, requireUserId(request)) };
   });
 
   app.patch("/api/agents/:id", async (request) => {
@@ -106,7 +106,7 @@ export async function createApp(
 
   app.delete("/api/agents/:id", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return service.deleteAgent(id, requireUserId(request));
+    return await service.deleteAgent(id, requireUserId(request));
   });
 
   app.post("/api/agents/:id/start", async (request) => {
@@ -121,12 +121,12 @@ export async function createApp(
 
   app.get("/api/agents/:id/messages", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { messages: service.getMessages(id, requireUserId(request)) };
+    return { messages: await service.getMessages(id, requireUserId(request)) };
   });
 
   app.get("/api/agents/:id/runs", async (request) => {
     const { id } = agentIdParams.parse(request.params);
-    return { runs: service.getRuns(id, requireUserId(request)) };
+    return { runs: await service.getRuns(id, requireUserId(request)) };
   });
 
   app.post("/api/agents/:id/messages", async (request, reply) => {
@@ -138,7 +138,7 @@ export async function createApp(
 
   app.get("/api/runs/:id", async (request) => {
     const { id } = runIdParams.parse(request.params);
-    return { run: service.getRun(id, requireUserId(request)) };
+    return { run: await service.getRun(id, requireUserId(request)) };
   });
 
   if (config.nodeEnv === "production") {
