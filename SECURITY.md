@@ -24,8 +24,11 @@ credentials, personal data, or exploit details in an issue.
 ## Safe use
 
 - Use a dedicated development machine or disposable ECS instance.
-- Use a scoped, revocable Ark key, and keep the Supabase `service_role` key
-  (never used by this app) out of every environment.
+- Use a scoped, revocable Ark key. The Supabase `service_role` key is
+  optional (only needed for cross-machine Postgres persistence — see
+  README.md#data-persistence-supabase) and bypasses all access control if
+  set; use your own project's key, not a shared one, and never expose it to
+  the browser.
 - Keep local use on loopback and restrict ECS Web and SSH CIDRs.
 - Add HTTPS before exposing sign-in over an untrusted network.
 - Never mount production data or provide Volcengine account AK/SK to Agents.

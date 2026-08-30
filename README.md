@@ -13,21 +13,17 @@ Volcengine ECS.
 > has no tracing, audit, or hardened sandbox middleware. Do not use production
 > data or credentials. See [SECURITY.md](SECURITY.md).
 
-## Screenshots
-
-### Agent Playground
-
-![Agent Playground showing lifecycle controls, starter prompts, and the Codex Runtime](docs/assets/playground.jpg)
-
-### Create an Agent
-
-![Create Agent form with name, description, and workspace instructions](docs/assets/create-agent.jpg)
-
 ## Features
 
 - React and TypeScript Web UI
 - Agent create, edit, start, stop, delete, and multi-turn chat
 - Fastify control plane with asynchronous Run state
+- Per-user identity and Agent ownership via Supabase Auth
+- Two-tier prompt-injection scanning (static rules + an Ark semantic judge)
+  gates every prompt and workspace file before Codex runs
+- Delete/modify confirmation gate — Codex proposes file changes in an
+  isolated staging copy; nothing touches the real workspace until you
+  review the diff and confirm
 - Persistent Agent workspaces and Codex sessions
 - Disposable Docker, Colima, or Podman container for each local turn
 - Docker and Terraform deployment paths for Volcengine ECS
@@ -38,8 +34,10 @@ Volcengine ECS.
 - npm 10+
 - Docker, Colima, or Podman
 - A Volcengine Ark API key and endpoint that supports the Responses API
-- A Supabase project (free tier is fine) for sign-in — see
-  [Authentication](#authentication-supabase)
+
+Sign-in works out of the box against a Supabase project already configured
+for reviewers — no Supabase account needed just to try the app. See
+[Authentication](#authentication-supabase) if you'd rather use your own.
 
 Codex CLI is included in the Runtime image and is not required on the host.
 
@@ -76,17 +74,18 @@ cp .env.example .env
 
 Edit `.env` and fill in:
 
-- `ARK_API_KEY` / `ARK_MODEL` — your own Ark credentials.
-- `SUPABASE_URL` / `SUPABASE_ANON_KEY` / the matching `VITE_` copies — **your
-  own** free Supabase project (create one at [supabase.com](https://supabase.com),
-  values are under Settings > API). This is required — the app is gated
-  behind sign-in, and every reviewer needs their own project for this, the
-  same way everyone needs their own Ark key. See
-  [Authentication](#authentication-supabase) for the two-minute setup.
-- `SUPABASE_SERVICE_ROLE_KEY` — optional, leave blank. Only needed if you
-  also want Agents/chat history to persist in Postgres instead of a local
-  file; see [Data persistence](#data-persistence-supabase). Nothing below
-  requires this.
+- `ARK_API_KEY` / `ARK_MODEL` — your own Ark credentials. Required.
+- `SUPABASE_URL` / `SUPABASE_ANON_KEY` / the matching `VITE_` copies — already
+  filled in with a project set up for reviewers to sign in against. These are
+  Supabase's public client credentials (see the comment above them in
+  [`.env.example`](.env.example) for why that's safe to commit), so there's
+  nothing to do here unless you'd rather use your own project — see
+  [Authentication](#authentication-supabase).
+- `SUPABASE_SERVICE_ROLE_KEY` — optional, genuinely secret, leave blank.
+  Only needed if you want Agents/chat history to persist in Postgres instead
+  of a local file, and it must come from your own separate Supabase project;
+  see [Data persistence](#data-persistence-supabase). Nothing below requires
+  this.
 
 ### 4. Start the POC
 
@@ -160,13 +159,11 @@ Required values in `.env`:
 ```dotenv
 ARK_API_KEY=your-ark-api-key
 ARK_MODEL=ep-your-endpoint-id
-SUPABASE_URL=https://your-project-ref.supabase.co
-SUPABASE_ANON_KEY=your-anon-key
-VITE_SUPABASE_URL=https://your-project-ref.supabase.co
-VITE_SUPABASE_ANON_KEY=your-anon-key
 ```
 
-The `VITE_` pair must be set *before* the build — Vite bakes them into the
+The `SUPABASE_*`/`VITE_SUPABASE_*` pairs are already filled in for sign-in —
+see [Authentication](#authentication-supabase) if you'd rather use your own
+project. The `VITE_` pair must be set *before* the build — Vite bakes them into the
 browser bundle at build time, so `docker compose up --build` reads them from
 `.env` as build args, not as a running-container env var. Changing them
 later needs a rebuild, not just a restart.
@@ -213,24 +210,26 @@ write from a different account with a 404, including sending a prompt to
 someone else's Agent. See [`agent-service.test.ts`](apps/server/src/agent-service.test.ts)
 for the isolation tests.
 
+**Nothing to set up by default.** [`.env.example`](.env.example) already has
+a Supabase project's URL and anon (public) key filled in for reviewers to
+sign in against — clone, copy `.env.example` to `.env`, add your Ark
+credentials, and sign up with any email/password. The `SUPABASE_*` pair is
+read by the server to verify sessions; the `VITE_`-prefixed copies are the
+same values exposed to the browser build (Vite only bundles
+`VITE_`-prefixed variables). Publishing the anon key is intentional and
+safe — it's Supabase's public client key, designed to be shipped in
+browser code and constrained by Row Level Security, unlike the
+`service_role` key, which must never appear here.
+
+Prefer your own project instead of the shared one:
+
 1. Create a project at [supabase.com](https://supabase.com). Sign-in itself
    needs no schema — it uses Supabase's built-in `auth.users`. Skip to
    [Data persistence](#data-persistence-supabase) below if you also want
    Agents/Messages/Runs to follow the account across machines.
-2. Copy **Settings > API > Project URL** and **anon public key** into `.env`:
-
-   ```dotenv
-   SUPABASE_URL=https://your-project-ref.supabase.co
-   SUPABASE_ANON_KEY=your-anon-key
-   VITE_SUPABASE_URL=https://your-project-ref.supabase.co
-   VITE_SUPABASE_ANON_KEY=your-anon-key
-   ```
-
-   The `SUPABASE_*` pair is read by the server to verify sessions. The
-   `VITE_`-prefixed copies are the same values, exposed to the browser build
-   (Vite only bundles `VITE_`-prefixed variables). The anon key is Supabase's
-   public client key, safe to ship in the browser — never put the
-   `service_role` key here.
+2. Copy **Settings > API > Project URL** and **anon public key** into `.env`,
+   replacing the pre-filled values, for all four of `SUPABASE_URL`,
+   `SUPABASE_ANON_KEY`, `VITE_SUPABASE_URL`, and `VITE_SUPABASE_ANON_KEY`.
 3. Email/password sign-up works immediately. Supabase requires confirming the
    email by default — for frictionless demos, turn that off under
    **Authentication > Providers > Email > Confirm email**.
@@ -256,11 +255,18 @@ freshly-provisioned empty workspace (handled automatically in
 [`agent-service.ts`](apps/server/src/agent-service.ts) — it can't resume a
 session it never had).
 
-1. In the Supabase SQL Editor, run
+This is the one place in this app a genuinely secret key is involved, so it
+needs **your own** Supabase project — never the shared sign-in project from
+above, since its service_role key would let anyone read or write every
+reviewer's Agents and data.
+
+1. Create your own project at [supabase.com](https://supabase.com) if you
+   don't already have one from the previous section.
+2. In its SQL Editor, run
    [`docs/supabase-agents-schema.sql`](docs/supabase-agents-schema.sql) once
    (idempotent — safe to re-run).
-2. Copy **Settings > API > service_role secret** (not the anon key) into
-   `.env` only:
+3. Copy that project's **Settings > API > service_role secret** (not the
+   anon key) into `.env` only:
 
    ```dotenv
    SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
@@ -270,7 +276,7 @@ session it never had).
    access control and must never reach the browser. Ownership is enforced
    in application code ([`supabase-repository.ts`](apps/server/src/supabase-repository.ts)),
    with Row Level Security policies on the tables as defense-in-depth.
-3. Restart the server. Leave `SUPABASE_SERVICE_ROLE_KEY` unset to keep using
+4. Restart the server. Leave `SUPABASE_SERVICE_ROLE_KEY` unset to keep using
    the local JSON file — nothing else changes.
 
 ## Deployment
@@ -327,16 +333,26 @@ flowchart LR
     API --> Repo{"AgentRepository"}
     Repo -->|SUPABASE_SERVICE_ROLE_KEY set| PG["Supabase Postgres: Agents, Messages, Runs"]
     Repo -->|unset| JSON["Local .data/launchpad.json"]
-    API --> Workspaces["Local Agent workspaces (machine-specific)"]
-    API --> Runtime{"Runtime provider"}
+    API --> Scan{"Injection scanner: static rules + Ark semantic judge"}
+    Scan -->|malicious| Blocked["Run marked blocked — Runtime never starts"]
+    Scan -->|clear| Stage["Staged copy of the Agent workspace"]
+    Stage --> Runtime{"Runtime provider"}
     Runtime -->|Local POC| Container["Disposable Docker / Colima / Podman container"]
     Runtime -->|ECS profile| Codex["Codex CLI in application container"]
     Container --> Ark["Volcengine Ark Responses API"]
     Codex --> Ark
+    Ark --> Diff["File changes diffed against the real workspace"]
+    Diff -->|user confirms| Commit["Swapped into the Agent's real workspace"]
+    Diff -->|user discards| Discard["Staged copy deleted — nothing applied"]
 ```
 
 The first turn uses `codex exec`; later turns resume the stored Codex thread.
-Deleting an Agent archives its workspace under `workspaces/.deleted/`.
+Every prompt and every workspace file is scanned before Codex ever sees it;
+a scan hit blocks the run and nothing is staged. Codex itself always works
+in an isolated staged copy, never the real workspace — any file it creates,
+modifies, or deletes sits pending review until you confirm (swaps the
+staged copy in) or discard (deletes it, real workspace untouched). Deleting
+an Agent archives its workspace under `workspaces/.deleted/`.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for component and extension
 boundaries.
