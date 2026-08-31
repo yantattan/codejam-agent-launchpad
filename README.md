@@ -1,21 +1,16 @@
-# Volc Agent Launchpad
-
-A minimal Agent platform for three-day middleware hackathons. It provides Agent
-CRUD, a browser Playground, persistent workspaces, and Codex CLI backed by the
-Volcengine Ark Responses API.
+# Volc Agent Launchpad - Secure File Handling Middleware
 
 Run it locally with Docker, Colima, or rootless Podman, or deploy it to
 Volcengine ECS.
 
 > [!WARNING]
-> This is a hackathon proof of concept. It has per-user identity and Agent
-> ownership (see [Authentication](#authentication-supabase) below) but still
+> This app has per-user identity and Agent ownership
+> (see [Authentication](#authentication-supabase) below) but still
 > has no tracing, audit, or hardened sandbox middleware. Do not use production
 > data or credentials. See [SECURITY.md](SECURITY.md).
 
 ## Features
 
-- React and TypeScript Web UI
 - Agent create, edit, start, stop, delete, and multi-turn chat
 - Fastify control plane with asynchronous Run state
 - Per-user identity and Agent ownership via Supabase Auth
