@@ -18,6 +18,29 @@ import type { TransactionHandle, WorkspaceTransactionManager } from "./workspace
 
 const now = () => new Date().toISOString();
 
+// Prepended to every turn's actual prompt to the Runner — not to what's
+// stored/shown as the user's message. AGENTS.md carries the same rule, but
+// Codex only reads that file at the *start* of a session; `codex exec ...
+// resume <threadId>` continues an existing session without re-reading it,
+// so a file-only instruction never reaches an already-running thread. This
+// reaches the model fresh on every single turn regardless of thread state.
+const PROPOSAL_WORDING_REMINDER =
+  "[Platform reminder, not part of the user's request: you must still " +
+  "actually perform every requested file change now, in this turn, exactly " +
+  "as you normally would — do not hold off, and do not ask the user for " +
+  "permission or confirmation yourself. A separate review step outside this " +
+  "conversation lets a human approve or discard your changes afterward; " +
+  "that happens automatically once you finish, so just do the work and " +
+  "finish the turn normally, without asking a question or waiting for a " +
+  "reply. Only the wording of your summary should change: describe what " +
+  'you changed using proposal language — e.g. "I\'ve prepared this change" ' +
+  'rather than completed-action language like "Done" or "I\'ve deleted X" — ' +
+  "since your summary is shown before the change is approved.]";
+
+function buildRunnerPrompt(prompt: string): string {
+  return PROPOSAL_WORDING_REMINDER + "\n\n" + prompt;
+}
+
 function describeScan(verdict: ScanVerdict): string {
   const blocking = verdict.findings.filter((item) => item.severity === "malicious");
   const list = (blocking.length > 0 ? blocking : verdict.findings).slice(0, 3);
@@ -336,6 +359,13 @@ export class AgentService {
       await this.repository.updateAgent(agentAtStart.id, agentAtStart.ownerId, {
         codexThreadId: null,
       });
+    } else {
+      // Refreshes AGENTS.md from the current platform template on every
+      // turn, not just at creation/edit time — so a change to the
+      // platform-level rules (e.g. "describe changes as proposals, not
+      // completed actions") reaches every existing Agent immediately,
+      // without requiring the user to re-save its settings first.
+      await this.workspaces.writeInstructions(agentAtStart);
     }
 
     let handle: TransactionHandle | null = null;
@@ -400,7 +430,7 @@ export class AgentService {
       const result = await this.runner.run({
         agentId: agentAtStart.id,
         workspacePath: handle.workingPath,
-        prompt: run.prompt,
+        prompt: buildRunnerPrompt(run.prompt),
         threadId,
       });
 

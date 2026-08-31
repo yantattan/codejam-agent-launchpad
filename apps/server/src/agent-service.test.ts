@@ -215,8 +215,12 @@ describe("Cross-machine recovery", () => {
     const runner: AgentRunner = {
       async run(request) {
         seenThreadIds.push(request.threadId);
+        // The Runner receives a platform reminder prepended to the actual
+        // prompt (see the "Proposal-wording reminder" suite) — echo just
+        // the original prompt back, since that's what this test cares about.
+        const actualPrompt = request.prompt.split("\n\n").pop() ?? request.prompt;
         return {
-          output: "ok: " + request.prompt,
+          output: "ok: " + actualPrompt,
           threadId: "thread-" + seenThreadIds.length,
           usage: null,
         };
@@ -353,6 +357,41 @@ describe("Prompt-injection scanning", () => {
         (item) => item.path === "notes.txt" && item.technique === "fake-system-message",
       ),
     ).toBe(true);
+  });
+});
+
+describe("Proposal-wording reminder", () => {
+  it("tells the Runner every change is a proposal, without altering the stored/displayed prompt", async () => {
+    let receivedPrompt = "";
+    const runner: AgentRunner = {
+      async run(request) {
+        receivedPrompt = request.prompt;
+        return { output: "ok", threadId: request.threadId ?? "fake-thread", usage: null };
+      },
+      async cancel() {
+        return false;
+      },
+      async isAvailable() {
+        return true;
+      },
+    };
+    const { service } = await makeService(runner);
+    const agent = await service.createAgent({ name: "Reminder Check" }, ownerA);
+    const { run, message } = await service.sendMessage(agent.id, "hello there", ownerA);
+    await expect.poll(async () => (await service.getRun(run.id, ownerA)).status).toBe("completed");
+
+    // The Runner sees a platform reminder plus the original prompt — the
+    // reminder must tell it to actually do the work (not ask permission),
+    // and to describe it as a proposal rather than a finished action.
+    expect(receivedPrompt).toContain("do not ask the user for");
+    expect(receivedPrompt).toContain("proposal language");
+    expect(receivedPrompt).toContain("hello there");
+    // ...but what's stored and shown to the user is the clean original text,
+    // with no reminder text leaked into it.
+    expect((await service.getRun(run.id, ownerA)).prompt).toBe("hello there");
+    expect(message.content).toBe("hello there");
+    const messages = await service.getMessages(agent.id, ownerA);
+    expect(messages[0]?.content).toBe("hello there");
   });
 });
 

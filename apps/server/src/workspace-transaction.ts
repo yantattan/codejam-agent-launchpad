@@ -37,6 +37,37 @@ async function pathExists(target: string): Promise<boolean> {
   }
 }
 
+const RENAME_RETRY_ATTEMPTS = 6;
+const RENAME_RETRY_BASE_DELAY_MS = 250;
+
+export function isTransientRenameError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EPERM" || code === "EBUSY" || code === "ENOTEMPTY";
+}
+
+/**
+ * A plain `rename()` on a directory that a just-exited process (a disposable
+ * Docker/Podman Runtime container, an editor, a virus scanner, a search
+ * indexer) touched a moment ago can fail transiently on Windows with EPERM
+ * or EBUSY, even though nothing is genuinely still using it — the OS hasn't
+ * released the handle yet. This retries with backoff instead of failing the
+ * whole commit/undo outright; almost every real occurrence clears within a
+ * second or two.
+ */
+async function renameWithRetry(source: string, destination: string): Promise<void> {
+  for (let attempt = 1; attempt <= RENAME_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await rename(source, destination);
+      return;
+    } catch (error) {
+      if (attempt === RENAME_RETRY_ATTEMPTS || !isTransientRenameError(error)) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, RENAME_RETRY_BASE_DELAY_MS * attempt));
+    }
+  }
+}
+
 /** Moves any excluded directory (node_modules, etc.) from the old
  * persistent snapshot into the newly-committed one — those never got
  * staged, so without this they'd silently disappear on every commit. */
@@ -46,7 +77,7 @@ async function carryForwardExcluded(previousDir: string, newDir: string): Promis
     if (await pathExists(destination)) continue;
     const source = path.join(previousDir, name);
     if (!(await pathExists(source))) continue;
-    await rename(source, destination);
+    await renameWithRetry(source, destination);
   }
 }
 
@@ -237,13 +268,13 @@ export class FileSystemWorkspaceTransactionManager implements WorkspaceTransacti
   async commit(handle: TransactionHandle, options: { keepUndoSnapshot?: boolean } = {}): Promise<void> {
     const previousPath = handle.persistentPath + ".prev-" + handle.agentId;
     await rm(previousPath, { recursive: true, force: true });
-    await rename(handle.persistentPath, previousPath);
-    await rename(handle.workingPath, handle.persistentPath);
+    await renameWithRetry(handle.persistentPath, previousPath);
+    await renameWithRetry(handle.workingPath, handle.persistentPath);
     await carryForwardExcluded(previousPath, handle.persistentPath);
     if (options.keepUndoSnapshot) {
       const undoPath = this.undoPathFor(handle.agentId);
       await rm(undoPath, { recursive: true, force: true });
-      await rename(previousPath, undoPath);
+      await renameWithRetry(previousPath, undoPath);
     } else {
       await rm(previousPath, { recursive: true, force: true });
     }
@@ -264,8 +295,8 @@ export class FileSystemWorkspaceTransactionManager implements WorkspaceTransacti
     }
     const discardPath = persistentPath + ".undone-" + agentId;
     await rm(discardPath, { recursive: true, force: true });
-    await rename(persistentPath, discardPath);
-    await rename(undoPath, persistentPath);
+    await renameWithRetry(persistentPath, discardPath);
+    await renameWithRetry(undoPath, persistentPath);
     await carryForwardExcluded(discardPath, persistentPath);
     await rm(discardPath, { recursive: true, force: true });
   }

@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { FileSystemWorkspaceTransactionManager } from "./workspace-transaction.js";
+import { FileSystemWorkspaceTransactionManager, isTransientRenameError } from "./workspace-transaction.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -256,5 +256,20 @@ describe("FileSystemWorkspaceTransactionManager — hasActive / cleanupStale", (
     expect(removed).toBe(2);
     expect(await manager.hasActive("agent-1")).toBe(false);
     expect(await manager.hasActive("agent-2")).toBe(false);
+  });
+});
+
+describe("isTransientRenameError", () => {
+  it("treats EPERM/EBUSY/ENOTEMPTY as transient — worth retrying", () => {
+    for (const code of ["EPERM", "EBUSY", "ENOTEMPTY"]) {
+      expect(isTransientRenameError({ code })).toBe(true);
+    }
+  });
+
+  it("does not treat other errors as transient", () => {
+    expect(isTransientRenameError({ code: "ENOENT" })).toBe(false);
+    expect(isTransientRenameError(new Error("something else"))).toBe(false);
+    expect(isTransientRenameError(null)).toBe(false);
+    expect(isTransientRenameError(undefined)).toBe(false);
   });
 });
